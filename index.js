@@ -10,61 +10,47 @@ app.use(cors());
 const server = http.createServer(app);
 const io = new Server(server, {
     cors: {
-        origin: "*", // Permitir que cualquier frontend se conecte
+        origin: "*", // Permite que cualquier frontend se conecte
         methods: ["GET", "POST"]
     }
 });
 
-// Guardaremos las partidas en memoria
-// Estructura: { "id_partida": { game: ChessInstance, players: [] } }
-const rooms = {};
+let game = new Chess();
 
 io.on('connection', (socket) => {
-    console.log('Usuario conectado:', socket.id);
+    console.log('Cliente conectado:', socket.id);
 
-    // Cuando un jugador se une a una sala (ID de la partida)
-    socket.on('join_room', (roomId) => {
-        socket.join(roomId);
-        
-        if (!rooms[roomId]) {
-            rooms[roomId] = {
-                game: new Chess(),
-                players: []
-            };
-        }
-        
-        // Enviar el estado actual del juego al jugador que entra
-        socket.emit('init_game', rooms[roomId].game.pgn());
-        console.log(`Usuario ${socket.id} entró a la sala: ${roomId}`);
-    });
+    // Enviar estado actual al conectar
+    socket.emit('init_game', game.pgn());
 
-    // Cuando un jugador hace un movimiento
-    socket.on('move', ({ roomId, move }) => {
-        const room = rooms[roomId];
-        if (!room) return;
-
+    socket.on('move', (moveData) => {
         try {
-            // Validar y aplicar el movimiento en el servidor
-            const result = room.game.move(move);
-            
+            const result = game.move(moveData);
             if (result) {
-                // Si el movimiento es legal, avisar a TODOS en la sala
-                io.to(roomId).emit('update_game', {
-                    pgn: room.game.pgn(),
+                // Emitir a todos los demás el movimiento y el PGN actualizado
+                io.emit('update_game', {
+                    pgn: game.pgn(),
                     move: result
                 });
+                console.log(`Movimiento legal: ${result.san}`);
+                
+                if (game.isGameOver()) {
+                    console.log("¡PARTIDA FINALIZADA!");
+                    console.log("PGN FINAL:", game.pgn());
+                }
             }
         } catch (e) {
-            console.log("Movimiento ilegal intentado");
+            console.log("Intento de movimiento ilegal");
         }
     });
 
-    socket.on('disconnect', () => {
-        console.log('Usuario desconectado');
+    socket.on('reset_game', () => {
+        game = new Chess();
+        io.emit('init_game', "");
     });
 });
 
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT || 10000;
 server.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 Servidor de Ajedrez Real-Time corriendo en puerto ${PORT}`);
+    console.log(`🚀 Servidor de Ajedrez vivo en puerto ${PORT}`);
 });
