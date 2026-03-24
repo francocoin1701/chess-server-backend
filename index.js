@@ -19,8 +19,8 @@ const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" }, transports: ['websocket'] });
 
 const activeGames = new Map();
-const GAME_TIME = 600; // 10 minutos normal
-const START_GRACE_TIME = 10; // 10 segundos de gracia inicial
+const GAME_TIME = 600; 
+const START_GRACE_TIME = 10;
 
 io.on('connection', (socket) => {
     socket.on('auth_web3', async ({ address, signature, message }) => {
@@ -49,19 +49,17 @@ io.on('connection', (socket) => {
                 timers: { w: GAME_TIME, b: GAME_TIME },
                 moveCount: 0,
                 lastMoveTimestamp: null,
-                status: 'waiting' // waiting, active, cancelled
+                status: 'waiting'
             });
         } else {
             const g = activeGames.get(roomId);
             if (!g.white && g.black !== socket.wallet) g.white = socket.wallet;
             else if (!g.black && g.white !== socket.wallet) g.black = socket.wallet;
 
-            // SENTIDO COMÚN: Si ya están los dos, empieza el tiempo de gracia de 10s
             if (g.white && g.black && g.status === 'waiting') {
                 g.status = 'active';
                 g.lastMoveTimestamp = Date.now();
-                g.timers.w = START_GRACE_TIME; // El blanco tiene 10s para abrir
-                console.log(`Sala ${roomId}: Comienza tiempo de gracia para blancas`);
+                g.timers.w = START_GRACE_TIME; 
             }
         }
 
@@ -90,35 +88,34 @@ io.on('connection', (socket) => {
                 g.moveCount++;
                 const now = Date.now();
                 
-                // Lógica de 10 segundos para las dos primeras jugadas
-                if (g.moveCount === 1) {
-                    // El blanco movió a tiempo, ahora el negro tiene 10s de gracia
-                    g.timers.b = START_GRACE_TIME;
-                    g.timers.w = GAME_TIME; // El blanco recupera su tiempo normal
-                } else if (g.moveCount === 2) {
-                    // El negro movió a tiempo, ahora ambos pasan a tiempo normal (10m)
-                    g.timers.b = GAME_TIME;
-                    g.timers.w = GAME_TIME;
-                } else {
-                    // Juego normal después de la apertura
-                    const elapsed = Math.floor((now - g.lastMoveTimestamp) / 1000);
-                    g.timers[turn] -= elapsed;
-                }
-
+                // Cálculo de tiempo
+                const elapsed = Math.floor((now - g.lastMoveTimestamp) / 1000);
+                g.timers[turn] -= elapsed;
                 g.lastMoveTimestamp = now;
 
-                if (g.timers[turn] <= 0) {
-                    g.status = 'cancelled';
+                // Si hay mate o tablas, paramos todo
+                if (g.chess.isGameOver()) {
+                    g.status = 'finished';
+                    await db.query('UPDATE users SET last_color = $1 WHERE wallet = $2', ['w', g.white]);
+                    await db.query('UPDATE users SET last_color = $1 WHERE wallet = $2', ['b', g.black]);
+                } else {
+                    // Si no es el fin, ajustamos tiempos para la jugada siguiente
+                    if (g.moveCount === 1) { g.timers.b = START_GRACE_TIME; g.timers.w = GAME_TIME; }
+                    else if (g.moveCount === 2) { g.timers.b = GAME_TIME; }
+                }
+
+                if (g.timers[turn] <= 0 && g.status !== 'finished') {
+                    g.status = 'finished';
                     io.to(roomId).emit('game_over', { reason: g.moveCount < 2 ? "timeout_start" : "timeout", winner: turn === 'w' ? 'b' : 'w' });
                 } else {
-                    io.to(roomId).emit('update_game', { pgn: g.chess.pgn(), timers: g.timers });
+                    io.to(roomId).emit('update_game', { pgn: g.chess.pgn(), timers: g.timers, status: g.status });
                 }
             }
         } catch (e) { socket.emit('error_msg', "Ilegal"); }
     });
 
     socket.on('reset_game', (roomId) => {
-        activeGames.delete(roomId); // Limpiamos la sala por completo
+        activeGames.delete(roomId);
         io.to(roomId).emit('game_reset_complete');
     });
 });
