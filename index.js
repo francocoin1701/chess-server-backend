@@ -3,13 +3,12 @@ const http = require('http');
 const { Server } = require('socket.io');
 const { Chess } = require('chess.js');
 const cors = require('cors');
-const { ethers } = require('ethers');
+const { ethers } = require('ethers'); // Asegúrate que sea v6
 const { Client } = require('pg');
 
 const app = express();
 app.use(cors());
 
-// CONFIGURACIÓN DE BASE DE DATOS
 const connectionString = process.env.DATABASE_URL;
 
 const db = new Client({
@@ -17,7 +16,6 @@ const db = new Client({
     ssl: { rejectUnauthorized: false }
 });
 
-// Conectar a la base de datos con reintento
 async function connectDB() {
     if (!connectionString) {
         console.error("❌ ERROR: DATABASE_URL no definida en Render.");
@@ -35,7 +33,7 @@ connectDB();
 const server = http.createServer(app);
 const io = new Server(server, {
     cors: { origin: "*", methods: ["GET", "POST"] },
-    transports: ['websocket', 'polling'] // Asegura compatibilidad
+    transports: ['websocket', 'polling']
 });
 
 const games = new Map();
@@ -45,10 +43,10 @@ io.on('connection', (socket) => {
 
     socket.on('auth_web3', async ({ address, signature, message }) => {
         try {
-            const recoveredAddress = ethers.utils.verifyMessage(message, signature);
+            // CORRECCIÓN PARA ETHERS V6: Se usa ethers.verifyMessage directamente
+            const recoveredAddress = ethers.verifyMessage(message, signature);
+            
             if (recoveredAddress.toLowerCase() === address.toLowerCase()) {
-                
-                // Intentar insertar en la DB
                 const res = await db.query(
                     `INSERT INTO users (wallet) VALUES ($1) 
                      ON CONFLICT (wallet) DO UPDATE SET wallet = EXCLUDED.wallet
@@ -64,8 +62,7 @@ io.on('connection', (socket) => {
             }
         } catch (error) {
             console.error("❌ Error en auth_web3:", error.message);
-            // Enviamos el error real al front para saber qué pasa
-            socket.emit('auth_error', "Error de DB: " + error.message);
+            socket.emit('auth_error', "Error de servidor: " + error.message);
         }
     });
 
