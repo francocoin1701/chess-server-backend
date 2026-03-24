@@ -48,18 +48,37 @@ io.on('connection', (socket) => {
                 black: assigned === 'b' ? socket.wallet : null,
                 timers: { w: GAME_TIME, b: GAME_TIME },
                 moveCount: 0,
-                lastMoveTimestamp: null,
-                status: 'waiting'
+                lastMoveTimestamp: Date.now(),
+                status: 'waiting',
+                interval: null
             });
         } else {
             const g = activeGames.get(roomId);
             if (!g.white && g.black !== socket.wallet) g.white = socket.wallet;
             else if (!g.black && g.white !== socket.wallet) g.black = socket.wallet;
 
+            // CUANDO SE UNE EL SEGUNDO: ACTIVAR EL VIGILANTE DEL SERVIDOR
             if (g.white && g.black && g.status === 'waiting') {
                 g.status = 'active';
-                g.lastMoveTimestamp = Date.now();
                 g.timers.w = START_GRACE_TIME; 
+                g.lastMoveTimestamp = Date.now();
+                
+                // EL VIGILANTE: Revisa cada segundo si alguien perdió por tiempo
+                g.interval = setInterval(() => {
+                    const turn = g.chess.turn();
+                    const now = Date.now();
+                    const elapsed = Math.floor((now - g.lastMoveTimestamp) / 1000);
+                    const timeLeft = g.timers[turn] - elapsed;
+
+                    if (timeLeft <= 0) {
+                        clearInterval(g.interval);
+                        g.status = 'finished';
+                        io.to(roomId).emit('game_over', { 
+                            reason: g.moveCount < 2 ? "timeout_start" : "timeout", 
+                            winner: turn === 'w' ? 'b' : 'w' 
+                        });
+                    }
+                }, 1000);
             }
         }
 
@@ -85,36 +104,38 @@ io.on('connection', (socket) => {
 
         try {
             if (g.chess.move(moveData)) {
-                g.moveCount++;
                 const now = Date.now();
-                
-                // Cálculo de tiempo
                 const elapsed = Math.floor((now - g.lastMoveTimestamp) / 1000);
+                
+                // Descontar tiempo real
                 g.timers[turn] -= elapsed;
                 g.lastMoveTimestamp = now;
+                g.moveCount++;
 
-                // Si hay mate o tablas, paramos todo
+                // Lógica de los 10s de gracia
+                if (g.moveCount === 1) {
+                    g.timers.w = GAME_TIME; // Blanco ya movió, recupera sus 10m
+                    g.timers.b = START_GRACE_TIME; // Negro tiene 10s para responder
+                } else if (g.moveCount === 2) {
+                    g.timers.b = GAME_TIME; // Negro ya movió, recupera sus 10m
+                }
+
                 if (g.chess.isGameOver()) {
+                    clearInterval(g.interval);
                     g.status = 'finished';
                     await db.query('UPDATE users SET last_color = $1 WHERE wallet = $2', ['w', g.white]);
                     await db.query('UPDATE users SET last_color = $1 WHERE wallet = $2', ['b', g.black]);
+                    io.to(roomId).emit('update_game', { pgn: g.chess.pgn(), timers: g.timers, status: 'finished' });
                 } else {
-                    // Si no es el fin, ajustamos tiempos para la jugada siguiente
-                    if (g.moveCount === 1) { g.timers.b = START_GRACE_TIME; g.timers.w = GAME_TIME; }
-                    else if (g.moveCount === 2) { g.timers.b = GAME_TIME; }
-                }
-
-                if (g.timers[turn] <= 0 && g.status !== 'finished') {
-                    g.status = 'finished';
-                    io.to(roomId).emit('game_over', { reason: g.moveCount < 2 ? "timeout_start" : "timeout", winner: turn === 'w' ? 'b' : 'w' });
-                } else {
-                    io.to(roomId).emit('update_game', { pgn: g.chess.pgn(), timers: g.timers, status: g.status });
+                    io.to(roomId).emit('update_game', { pgn: g.chess.pgn(), timers: g.timers, status: 'active' });
                 }
             }
         } catch (e) { socket.emit('error_msg', "Ilegal"); }
     });
 
     socket.on('reset_game', (roomId) => {
+        const g = activeGames.get(roomId);
+        if (g && g.interval) clearInterval(g.interval);
         activeGames.delete(roomId);
         io.to(roomId).emit('game_reset_complete');
     });
