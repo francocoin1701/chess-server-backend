@@ -19,8 +19,8 @@ const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" }, transports: ['websocket'] });
 
 const activeGames = new Map();
-const GAME_TIME = 600; 
-const START_GRACE_TIME = 10;
+const GAME_TIME = 600; // 10 minutos
+const START_GRACE_TIME = 10; // 10 segundos iniciales
 
 io.on('connection', (socket) => {
     socket.on('auth_web3', async ({ address, signature, message }) => {
@@ -57,19 +57,22 @@ io.on('connection', (socket) => {
             if (!g.white && g.black !== socket.wallet) g.white = socket.wallet;
             else if (!g.black && g.white !== socket.wallet) g.black = socket.wallet;
 
-            // CUANDO SE UNE EL SEGUNDO: ACTIVAR EL VIGILANTE DEL SERVIDOR
+            // CUANDO SE UNE EL SEGUNDO JUGADOR
             if (g.white && g.black && g.status === 'waiting') {
                 g.status = 'active';
-                g.timers.w = START_GRACE_TIME; 
+                g.timers.w = START_GRACE_TIME; // Empiezan los 10s del blanco
                 g.lastMoveTimestamp = Date.now();
                 
-                // EL VIGILANTE: Revisa cada segundo si alguien perdió por tiempo
+                // --- EL VIGILANTE DEL SERVIDOR ---
                 g.interval = setInterval(() => {
+                    if (g.status !== 'active') return;
+
                     const turn = g.chess.turn();
                     const now = Date.now();
                     const elapsed = Math.floor((now - g.lastMoveTimestamp) / 1000);
                     const timeLeft = g.timers[turn] - elapsed;
 
+                    // SI SE ACABA EL TIEMPO (De 10s o de 10m)
                     if (timeLeft <= 0) {
                         clearInterval(g.interval);
                         g.status = 'finished';
@@ -77,6 +80,9 @@ io.on('connection', (socket) => {
                             reason: g.moveCount < 2 ? "timeout_start" : "timeout", 
                             winner: turn === 'w' ? 'b' : 'w' 
                         });
+                    } else {
+                        // Sincronización visual opcional cada segundo (puedes quitarlo para ahorrar ancho de banda)
+                        // io.to(roomId).emit('tick', { timers: { ...g.timers, [turn]: timeLeft } });
                     }
                 }, 1000);
             }
@@ -107,22 +113,24 @@ io.on('connection', (socket) => {
                 const now = Date.now();
                 const elapsed = Math.floor((now - g.lastMoveTimestamp) / 1000);
                 
-                // Descontar tiempo real
+                // Descontar tiempo real del turno que acaba de mover
                 g.timers[turn] -= elapsed;
                 g.lastMoveTimestamp = now;
                 g.moveCount++;
 
-                // Lógica de los 10s de gracia
+                // Lógica de transición de tiempos
                 if (g.moveCount === 1) {
-                    g.timers.w = GAME_TIME; // Blanco ya movió, recupera sus 10m
-                    g.timers.b = START_GRACE_TIME; // Negro tiene 10s para responder
+                    g.timers.w = GAME_TIME; // Blanco movió en sus 10s, ahora tiene sus 10m
+                    g.timers.b = START_GRACE_TIME; // Negro tiene sus 10s para la primera jugada
                 } else if (g.moveCount === 2) {
-                    g.timers.b = GAME_TIME; // Negro ya movió, recupera sus 10m
+                    g.timers.b = GAME_TIME; // Negro movió en sus 10s, ahora tiene sus 10m
                 }
 
+                // Si hay JAQUE MATE o tablas según el motor
                 if (g.chess.isGameOver()) {
                     clearInterval(g.interval);
                     g.status = 'finished';
+                    // Persistir color en DB
                     await db.query('UPDATE users SET last_color = $1 WHERE wallet = $2', ['w', g.white]);
                     await db.query('UPDATE users SET last_color = $1 WHERE wallet = $2', ['b', g.black]);
                     io.to(roomId).emit('update_game', { pgn: g.chess.pgn(), timers: g.timers, status: 'finished' });
