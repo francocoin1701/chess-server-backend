@@ -19,6 +19,8 @@ const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" }, transports: ['websocket'] });
 
 const activeGames = new Map();
+const GAME_TIME = 600; // 10 minutos normal
+const START_GRACE_TIME = 10; // 10 segundos de gracia inicial
 
 io.on('connection', (socket) => {
     socket.on('auth_web3', async ({ address, signature, message }) => {
@@ -37,70 +39,87 @@ io.on('connection', (socket) => {
         socket.join(roomId);
 
         if (!activeGames.has(roomId)) {
-            // Lógica de alternancia: el creador toma el color opuesto a su última partida
             const res = await db.query('SELECT last_color FROM users WHERE wallet = $1', [socket.wallet]);
-            const last = res.rows[0]?.last_color;
-            const assigned = (last === 'w') ? 'b' : 'w';
+            const assigned = (res.rows[0]?.last_color === 'w') ? 'b' : 'w';
 
             activeGames.set(roomId, {
                 chess: new Chess(),
                 white: assigned === 'w' ? socket.wallet : null,
-                black: assigned === 'b' ? socket.wallet : null
+                black: assigned === 'b' ? socket.wallet : null,
+                timers: { w: GAME_TIME, b: GAME_TIME },
+                moveCount: 0,
+                lastMoveTimestamp: null,
+                status: 'waiting' // waiting, active, cancelled
             });
-            console.log(`Sala ${roomId}: Creador ${socket.wallet} asignado a ${assigned}`);
         } else {
             const g = activeGames.get(roomId);
-            // El segundo en entrar toma el color que quede libre
             if (!g.white && g.black !== socket.wallet) g.white = socket.wallet;
             else if (!g.black && g.white !== socket.wallet) g.black = socket.wallet;
-            console.log(`Sala ${roomId}: Segundo jugador ${socket.wallet} unido.`);
+
+            // SENTIDO COMÚN: Si ya están los dos, empieza el tiempo de gracia de 10s
+            if (g.white && g.black && g.status === 'waiting') {
+                g.status = 'active';
+                g.lastMoveTimestamp = Date.now();
+                g.timers.w = START_GRACE_TIME; // El blanco tiene 10s para abrir
+                console.log(`Sala ${roomId}: Comienza tiempo de gracia para blancas`);
+            }
         }
 
         const g = activeGames.get(roomId);
         const myColor = g.white === socket.wallet ? 'w' : (g.black === socket.wallet ? 'b' : 'viewer');
 
-        // Sincronización total para ambos PCs
         io.to(roomId).emit('init_game', {
             pgn: g.chess.pgn(),
             white: g.white,
-            black: g.black
+            black: g.black,
+            timers: g.timers,
+            status: g.status
         });
         socket.emit('player_color', myColor);
     });
 
     socket.on('move', async ({ roomId, moveData }) => {
         const g = activeGames.get(roomId);
-        if (!g || !socket.wallet) return;
+        if (!g || !socket.wallet || g.status !== 'active') return;
 
-        const chess = g.chess;
-        // El motor dice de quién es el turno ('w' o 'b')
-        const currentTurnColor = chess.turn(); 
-        const authorizedWallet = currentTurnColor === 'w' ? g.white : g.black;
-
-        // Solo la wallet dueña del color de turno puede mover
-        if (socket.wallet !== authorizedWallet) {
-            return socket.emit('error_msg', "No es tu turno de mover");
-        }
+        const turn = g.chess.turn();
+        if (socket.wallet !== (turn === 'w' ? g.white : g.black)) return;
 
         try {
-            if (chess.move(moveData)) {
-                io.to(roomId).emit('update_game', { pgn: chess.pgn() });
+            if (g.chess.move(moveData)) {
+                g.moveCount++;
+                const now = Date.now();
                 
-                if (chess.isGameOver()) {
-                    // Actualizar historial en DB al finalizar
-                    if (g.white) await db.query('UPDATE users SET last_color = $1 WHERE wallet = $2', ['w', g.white]);
-                    if (g.black) await db.query('UPDATE users SET last_color = $1 WHERE wallet = $2', ['b', g.black]);
+                // Lógica de 10 segundos para las dos primeras jugadas
+                if (g.moveCount === 1) {
+                    // El blanco movió a tiempo, ahora el negro tiene 10s de gracia
+                    g.timers.b = START_GRACE_TIME;
+                    g.timers.w = GAME_TIME; // El blanco recupera su tiempo normal
+                } else if (g.moveCount === 2) {
+                    // El negro movió a tiempo, ahora ambos pasan a tiempo normal (10m)
+                    g.timers.b = GAME_TIME;
+                    g.timers.w = GAME_TIME;
+                } else {
+                    // Juego normal después de la apertura
+                    const elapsed = Math.floor((now - g.lastMoveTimestamp) / 1000);
+                    g.timers[turn] -= elapsed;
+                }
+
+                g.lastMoveTimestamp = now;
+
+                if (g.timers[turn] <= 0) {
+                    g.status = 'cancelled';
+                    io.to(roomId).emit('game_over', { reason: g.moveCount < 2 ? "timeout_start" : "timeout", winner: turn === 'w' ? 'b' : 'w' });
+                } else {
+                    io.to(roomId).emit('update_game', { pgn: g.chess.pgn(), timers: g.timers });
                 }
             }
-        } catch (e) { socket.emit('error_msg', "Movimiento ilegal"); }
+        } catch (e) { socket.emit('error_msg', "Ilegal"); }
     });
 
     socket.on('reset_game', (roomId) => {
-        const g = activeGames.get(roomId);
-        if (g) {
-            g.chess.reset();
-            io.to(roomId).emit('init_game', { pgn: "", white: g.white, black: g.black });
-        }
+        activeGames.delete(roomId); // Limpiamos la sala por completo
+        io.to(roomId).emit('game_reset_complete');
     });
 });
 
