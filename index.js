@@ -10,103 +10,98 @@ const app = express();
 app.use(cors());
 
 const db = new Client({
-    connectionString: process.env.DATABASE_URL, 
+    connectionString: process.env.DATABASE_URL,
     ssl: { rejectUnauthorized: false }
 });
-
-db.connect()
-    .then(() => console.log("✅ Servidor conectado a la DB preparada"))
-    .catch(e => console.error("❌ Error: La DB no está lista. Ejecuta init_db.js primero.", e.message));
+db.connect().catch(e => console.error("Error DB:", e.message));
 
 const server = http.createServer(app);
-const io = new Server(server, {
-    cors: { origin: "*" },
-    transports: ['websocket', 'polling']
-});
+const io = new Server(server, { cors: { origin: "*" }, transports: ['websocket'] });
 
 const activeGames = new Map();
 
 io.on('connection', (socket) => {
-    
     socket.on('auth_web3', async ({ address, signature, message }) => {
         try {
-            const recoveredAddress = ethers.verifyMessage(message, signature);
-            if (recoveredAddress.toLowerCase() === address.toLowerCase()) {
-                await db.query(
-                    `INSERT INTO users (wallet) VALUES ($1) 
-                     ON CONFLICT (wallet) DO UPDATE SET wallet = EXCLUDED.wallet`, 
-                    [address.toLowerCase()]
-                );
+            const recovered = ethers.verifyMessage(message, signature);
+            if (recovered.toLowerCase() === address.toLowerCase()) {
+                await db.query(`INSERT INTO users (wallet) VALUES ($1) ON CONFLICT (wallet) DO UPDATE SET wallet = EXCLUDED.wallet`, [address.toLowerCase()]);
                 socket.wallet = address.toLowerCase();
                 socket.emit('auth_success', { wallet: socket.wallet });
             }
-        } catch (e) { socket.emit('auth_error', "Error en autenticación"); }
+        } catch (e) { socket.emit('auth_error', "Error Auth"); }
     });
 
     socket.on('join_room', async (roomId) => {
-        if (!socket.wallet) return socket.emit('error_msg', "Inicia sesión primero");
-
+        if (!socket.wallet) return;
         socket.join(roomId);
 
         if (!activeGames.has(roomId)) {
-            // Lógica de color alternado basada en DB
-            let assignedColor = 'w'; 
-            try {
-                const res = await db.query('SELECT last_color FROM users WHERE wallet = $1', [socket.wallet]);
-                assignedColor = res.rows[0]?.last_color === 'w' ? 'b' : 'w';
-            } catch (e) { console.log("Usando color por defecto"); }
+            // Lógica de alternancia: el creador toma el color opuesto a su última partida
+            const res = await db.query('SELECT last_color FROM users WHERE wallet = $1', [socket.wallet]);
+            const last = res.rows[0]?.last_color;
+            const assigned = (last === 'w') ? 'b' : 'w';
 
             activeGames.set(roomId, {
                 chess: new Chess(),
-                white: assignedColor === 'w' ? socket.wallet : null,
-                black: assignedColor === 'b' ? socket.wallet : null
+                white: assigned === 'w' ? socket.wallet : null,
+                black: assigned === 'b' ? socket.wallet : null
             });
+            console.log(`Sala ${roomId}: Creador ${socket.wallet} asignado a ${assigned}`);
         } else {
-            const gameData = activeGames.get(roomId);
-            if (!gameData.white && gameData.black !== socket.wallet) gameData.white = socket.wallet;
-            else if (!gameData.black && gameData.white !== socket.wallet) gameData.black = socket.wallet;
+            const g = activeGames.get(roomId);
+            // El segundo en entrar toma el color que quede libre
+            if (!g.white && g.black !== socket.wallet) g.white = socket.wallet;
+            else if (!g.black && g.white !== socket.wallet) g.black = socket.wallet;
+            console.log(`Sala ${roomId}: Segundo jugador ${socket.wallet} unido.`);
         }
 
-        const gameData = activeGames.get(roomId);
-        const myColor = gameData.white === socket.wallet ? 'w' : (gameData.black === socket.wallet ? 'b' : 'viewer');
+        const g = activeGames.get(roomId);
+        const myColor = g.white === socket.wallet ? 'w' : (g.black === socket.wallet ? 'b' : 'viewer');
 
+        // Sincronización total para ambos PCs
         io.to(roomId).emit('init_game', {
-            pgn: gameData.chess.pgn(),
-            white: gameData.white,
-            black: gameData.black
+            pgn: g.chess.pgn(),
+            white: g.white,
+            black: g.black
         });
         socket.emit('player_color', myColor);
     });
 
     socket.on('move', async ({ roomId, moveData }) => {
-        const gameData = activeGames.get(roomId);
-        if (!gameData || !socket.wallet) return;
+        const g = activeGames.get(roomId);
+        if (!g || !socket.wallet) return;
 
-        const turn = gameData.chess.turn();
-        const authorizedWallet = turn === 'w' ? gameData.white : gameData.black;
-        
-        if (socket.wallet !== authorizedWallet) return socket.emit('error_msg', "No es tu turno");
+        const chess = g.chess;
+        // El motor dice de quién es el turno ('w' o 'b')
+        const currentTurnColor = chess.turn(); 
+        const authorizedWallet = currentTurnColor === 'w' ? g.white : g.black;
+
+        // Solo la wallet dueña del color de turno puede mover
+        if (socket.wallet !== authorizedWallet) {
+            return socket.emit('error_msg', "No es tu turno de mover");
+        }
 
         try {
-            if (gameData.chess.move(moveData)) {
-                io.to(roomId).emit('update_game', { pgn: gameData.chess.pgn(), move: moveData });
-
-                if (gameData.chess.isGameOver()) {
-                    await db.query('UPDATE users SET last_color = $1 WHERE wallet = $2', ['w', gameData.white]);
-                    await db.query('UPDATE users SET last_color = $1 WHERE wallet = $2', ['b', gameData.black]);
+            if (chess.move(moveData)) {
+                io.to(roomId).emit('update_game', { pgn: chess.pgn() });
+                
+                if (chess.isGameOver()) {
+                    // Actualizar historial en DB al finalizar
+                    if (g.white) await db.query('UPDATE users SET last_color = $1 WHERE wallet = $2', ['w', g.white]);
+                    if (g.black) await db.query('UPDATE users SET last_color = $1 WHERE wallet = $2', ['b', g.black]);
                 }
             }
-        } catch (e) { console.log("Ilegal"); }
+        } catch (e) { socket.emit('error_msg', "Movimiento ilegal"); }
     });
 
     socket.on('reset_game', (roomId) => {
-        const gameData = activeGames.get(roomId);
-        if (gameData) {
-            gameData.chess.reset();
-            io.to(roomId).emit('init_game', { pgn: "", white: gameData.white, black: gameData.black });
+        const g = activeGames.get(roomId);
+        if (g) {
+            g.chess.reset();
+            io.to(roomId).emit('init_game', { pgn: "", white: g.white, black: g.black });
         }
     });
 });
 
-const PORT = process.env.PORT || 10000;
-server.listen(PORT, '0.0.0.0', () => console.log(`🚀 Servidor en puerto ${PORT}`));
+server.listen(process.env.PORT || 10000, '0.0.0.0');
