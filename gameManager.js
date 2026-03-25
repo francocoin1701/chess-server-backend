@@ -4,17 +4,19 @@ const db = require('./db');
 const activeGames = new Map();
 const GRACE_TIME = 10; 
 
-const createGame = async (roomId, creatorWallet, initialMinutes = 10) => {
-    const res = await db.query('SELECT last_color FROM users WHERE wallet = $1', [creatorWallet]);
+// AHORA RECIBE initialMinutes DESDE EL LOBBY
+const createGame = async (roomId, creatorWallet, initialMinutes) => {
+    const mins = (initialMinutes && initialMinutes > 0) ? initialMinutes : 10;
+    const timeInSeconds = mins * 60;
+
+    const res = await db.query('SELECT last_color FROM users WHERE wallet = $1', [creatorWallet.toLowerCase()]);
     const lastColor = res.rows[0]?.last_color;
     const assignedColor = lastColor === 'w' ? 'b' : 'w';
 
-    const timeInSeconds = initialMinutes * 60;
-
     const gameData = {
         chess: new Chess(),
-        white: assignedColor === 'w' ? creatorWallet : null,
-        black: assignedColor === 'b' ? creatorWallet : null,
+        white: assignedColor === 'w' ? creatorWallet.toLowerCase() : null,
+        black: assignedColor === 'b' ? creatorWallet.toLowerCase() : null,
         timers: { w: timeInSeconds, b: timeInSeconds },
         baseTime: timeInSeconds, 
         lastMoveTimestamp: Date.now(),
@@ -22,6 +24,7 @@ const createGame = async (roomId, creatorWallet, initialMinutes = 10) => {
         moveCount: 0,
         interval: null
     };
+    
     activeGames.set(roomId, gameData);
     return gameData;
 };
@@ -32,7 +35,9 @@ const handleMove = async (roomId, moveData, wallet) => {
 
     const turn = g.chess.turn();
     const authorizedWallet = turn === 'w' ? g.white : g.black;
-    if (wallet !== authorizedWallet) return { error: "No es tu turno" };
+    
+    // Comparación estricta en minúsculas
+    if (wallet.toLowerCase() !== authorizedWallet.toLowerCase()) return { error: "No es tu turno" };
 
     try {
         if (g.chess.move(moveData)) {
@@ -43,7 +48,6 @@ const handleMove = async (roomId, moveData, wallet) => {
             g.lastMoveTimestamp = now;
             g.moveCount++;
 
-            // Lógica de los 10s iniciales de gracia
             if (g.moveCount === 1) { 
                 g.timers.w = g.baseTime; 
                 g.timers.b = GRACE_TIME; 
