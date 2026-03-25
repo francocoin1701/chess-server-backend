@@ -24,7 +24,6 @@ const createGame = async (roomId, creatorWallet, initialMinutes) => {
         moveCount: 0,
         interval: null
     };
-    
     activeGames.set(roomId, gameData);
     return gameData;
 };
@@ -35,31 +34,31 @@ const handleMove = async (roomId, moveData, wallet) => {
 
     const turn = g.chess.turn();
     const authorized = turn === 'w' ? g.white : g.black;
-
     if (wallet.toLowerCase() !== authorized.toLowerCase()) return { error: "No es tu turno" };
 
     try {
         if (g.chess.move(moveData)) {
             const now = Date.now();
-            const elapsed = Math.floor((now - g.lastMoveTimestamp) / 1000);
-            
-            g.timers[turn] = Math.max(0, g.timers[turn] - elapsed);
+            g.timers[turn] -= Math.floor((now - g.lastMoveTimestamp) / 1000);
             g.lastMoveTimestamp = now;
 
-            if (g.moveCount === 0) { 
-                g.timers.w = g.baseTime; 
-                g.timers.b = GRACE_TIME; 
-            } else if (g.moveCount === 1) { 
-                g.timers.b = g.baseTime; 
-            }
-            
+            if (g.moveCount === 0) { g.timers.w = g.baseTime; g.timers.b = GRACE_TIME; }
+            else if (g.moveCount === 1) { g.timers.b = g.baseTime; }
             g.moveCount++;
 
+            // DETECCIÓN INTEGRAL DE FIN DE JUEGO
             if (g.chess.isGameOver()) {
                 g.status = 'finished';
-                if (g.interval) clearInterval(g.interval);
-                await db.query('UPDATE users SET last_color = $1 WHERE wallet = $2', ['w', g.white]);
-                await db.query('UPDATE users SET last_color = $1 WHERE wallet = $2', ['b', g.black]);
+                let result = { status: 'finished', pgn: g.chess.pgn(), timers: g.timers };
+                
+                if (g.chess.isCheckmate()) {
+                    result.reason = 'checkmate';
+                    result.winner = turn; // Quien movió y dio mate
+                } else {
+                    result.reason = 'draw'; // Stalemate, repetition, etc.
+                    result.winner = null;
+                }
+                return result;
             }
             return { success: true, pgn: g.chess.pgn(), timers: g.timers, status: g.status, lastMoveTimestamp: g.lastMoveTimestamp };
         }
