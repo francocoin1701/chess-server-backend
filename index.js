@@ -22,7 +22,7 @@ io.on('connection', (socket) => {
                 const wallet = address.toLowerCase();
                 await db.query(`INSERT INTO users (wallet) VALUES ($1) ON CONFLICT (wallet) DO UPDATE SET wallet = EXCLUDED.wallet`, [wallet]);
                 socket.wallet = wallet;
-                socket.emit('auth_success', { wallet: wallet });
+                socket.emit('auth_success', { wallet });
             }
         } catch (e) { socket.emit('auth_error', "Error Auth"); }
     });
@@ -36,7 +36,7 @@ io.on('connection', (socket) => {
         const roomId = `room_${Math.random().toString(36).substring(7)}`;
         const challenge = await lobbyManager.createChallenge(socket.wallet, amount, timeLimit, roomId);
         if (challenge) {
-            // Pasamos el timeLimit al manager para que cree la sala con el tiempo correcto
+            // El Manager ya asigna el color al creador basándose en su historial
             await gameManager.createGame(roomId, socket.wallet, timeLimit);
             io.emit('list_challenges', await lobbyManager.getOpenChallenges());
             socket.emit('challenge_created', { roomId });
@@ -50,39 +50,38 @@ io.on('connection', (socket) => {
 
         const success = await lobbyManager.updateChallengeStatus(roomId, 'playing');
         if (success) {
-            const joiner = socket.wallet.toLowerCase();
-            // Asignar al aceptador el color que dejó libre el creador
-            if (!g.white) g.white = joiner;
-            else g.black = joiner;
+            const opponent = socket.wallet.toLowerCase();
+            // El oponente toma el color que está NULL (el que el creador no eligió)
+            if (g.white === null) g.white = opponent;
+            else g.black = opponent;
 
-            io.emit('challenge_accepted_global', { roomId, joiner });
+            io.emit('challenge_accepted_global', { roomId, joiner: opponent });
             io.emit('list_challenges', await lobbyManager.getOpenChallenges());
         }
     });
 
     socket.on('join_room', async ({ roomId }) => {
-        if (!socket.wallet) return;
+        const wallet = socket.wallet?.toLowerCase();
+        if (!wallet) return;
         const g = gameManager.activeGames.get(roomId);
         if (!g) return;
 
         socket.join(roomId);
 
+        // Si ya están los dos, activar reloj
         if (g.white && g.black && g.status === 'waiting') {
             g.status = 'active';
-            g.timers.w = gameManager.GRACE_TIME;
             g.lastMoveTimestamp = Date.now();
-
             if (g.interval) clearInterval(g.interval);
             g.interval = setInterval(() => {
                 const turn = g.chess.turn();
                 const now = Date.now();
                 const elapsed = Math.floor((now - g.lastMoveTimestamp) / 1000);
                 const timeLeft = g.timers[turn] - elapsed;
-
                 if (timeLeft <= 0) {
                     clearInterval(g.interval);
                     g.status = 'finished';
-                    io.to(roomId).emit('game_over', { reason: g.moveCount < 2 ? "timeout_start" : "timeout", winner: turn === 'w' ? 'b' : 'w' });
+                    io.to(roomId).emit('game_over', { winner: turn === 'w' ? 'b' : 'w' });
                     lobbyManager.updateChallengeStatus(roomId, 'finished');
                 } else {
                     io.to(roomId).emit('tick', { timers: g.timers, turn, lastMoveTimestamp: g.lastMoveTimestamp });
@@ -90,9 +89,9 @@ io.on('connection', (socket) => {
             }, 1000);
         }
 
-        const myWallet = socket.wallet.toLowerCase();
-        const myColor = g.white === myWallet ? 'w' : (g.black === myWallet ? 'b' : 'viewer');
+        const myColor = (g.white === wallet) ? 'w' : (g.black === wallet ? 'b' : 'viewer');
         
+        socket.emit('player_color', myColor);
         io.to(roomId).emit('init_game', { 
             pgn: g.chess.pgn(), 
             white: g.white, 
@@ -101,14 +100,12 @@ io.on('connection', (socket) => {
             status: g.status, 
             lastMoveTimestamp: g.lastMoveTimestamp 
         });
-        socket.emit('player_color', myColor);
     });
 
     socket.on('move', async ({ roomId, moveData }) => {
         const result = await gameManager.handleMove(roomId, moveData, socket.wallet);
         if (result.error) return socket.emit('error_msg', result.error);
         io.to(roomId).emit('update_game', { pgn: result.pgn, timers: result.timers, status: result.status, lastMoveTimestamp: result.lastMoveTimestamp });
-        if (result.status === 'finished') lobbyManager.updateChallengeStatus(roomId, 'finished');
     });
 
     socket.on('reset_game', (roomId) => {
@@ -121,4 +118,4 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 10000;
-server.listen(PORT, '0.0.0.0', () => console.log(`🚀 Servidor Sincronizado en puerto ${PORT}`));
+server.listen(PORT, '0.0.0.0');
