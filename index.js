@@ -1,10 +1,8 @@
-// index.js completo
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const { ethers } = require('ethers');
-
 const db = require('./db');
 const gameManager = require('./gameManager');
 
@@ -14,7 +12,6 @@ const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" }, transports: ['websocket'] });
 
 io.on('connection', (socket) => {
-    
     socket.on('auth_web3', async ({ address, signature, message }) => {
         try {
             const recovered = ethers.verifyMessage(message, signature);
@@ -26,24 +23,23 @@ io.on('connection', (socket) => {
         } catch (e) { socket.emit('auth_error', "Error Auth"); }
     });
 
-    socket.on('join_room', async (roomId) => {
+    socket.on('join_room', async ({ roomId, timeLimit }) => {
         if (!socket.wallet) return;
         socket.join(roomId);
 
         let g = gameManager.activeGames.get(roomId);
         if (!g) {
-            g = await gameManager.createGame(roomId, socket.wallet);
+            // El tiempo viene del frontend (1, 3, 5, 10...)
+            g = await gameManager.createGame(roomId, socket.wallet, timeLimit || 10);
         } else {
             if (!g.white && g.black !== socket.wallet) g.white = socket.wallet;
             else if (!g.black && g.white !== socket.wallet) g.black = socket.wallet;
 
-            // Iniciar cronómetro si ambos están presentes
             if (g.white && g.black && g.status === 'waiting') {
                 g.status = 'active';
                 g.timers.w = gameManager.GRACE_TIME;
                 g.lastMoveTimestamp = Date.now();
 
-                // HEARTBEAT: Sincronización forzada cada segundo
                 g.interval = setInterval(() => {
                     const turn = g.chess.turn();
                     const now = Date.now();
@@ -53,34 +49,22 @@ io.on('connection', (socket) => {
                     if (timeLeft <= 0) {
                         clearInterval(g.interval);
                         g.status = 'finished';
-                        io.to(roomId).emit('game_over', { 
-                            reason: g.moveCount < 2 ? "timeout_start" : "timeout", 
-                            winner: turn === 'w' ? 'b' : 'w' 
-                        });
+                        io.to(roomId).emit('game_over', { reason: g.moveCount < 2 ? "timeout_start" : "timeout", winner: turn === 'w' ? 'b' : 'w' });
                     } else {
-                        // Enviamos el tiempo oficial del servidor a ambos PCs
-                        io.to(roomId).emit('tick', { 
-                            timers: { ...g.timers, [turn]: timeLeft } 
-                        });
+                        io.to(roomId).emit('tick', { timers: g.timers, turn: turn, lastMoveTimestamp: g.lastMoveTimestamp });
                     }
                 }, 1000);
             }
         }
-
         const myColor = g.white === socket.wallet ? 'w' : (g.black === socket.wallet ? 'b' : 'viewer');
-        io.to(roomId).emit('init_game', { pgn: g.chess.pgn(), white: g.white, black: g.black, timers: g.timers, status: g.status });
+        io.to(roomId).emit('init_game', { pgn: g.chess.pgn(), white: g.white, black: g.black, timers: g.timers, status: g.status, lastMoveTimestamp: g.lastMoveTimestamp });
         socket.emit('player_color', myColor);
     });
 
     socket.on('move', async ({ roomId, moveData }) => {
         const result = await gameManager.handleMove(roomId, moveData, socket.wallet);
         if (result.error) return socket.emit('error_msg', result.error);
-        
-        io.to(roomId).emit('update_game', { 
-            pgn: result.pgn, 
-            timers: result.timers, 
-            status: result.status 
-        });
+        io.to(roomId).emit('update_game', { pgn: result.pgn, timers: result.timers, status: result.status, lastMoveTimestamp: result.lastMoveTimestamp });
     });
 
     socket.on('reset_game', (roomId) => {
@@ -89,11 +73,7 @@ io.on('connection', (socket) => {
         gameManager.activeGames.delete(roomId);
         io.to(roomId).emit('game_reset_complete');
     });
-
-    socket.on('disconnect', () => {
-        console.log("Desconectado:", socket.id);
-    });
 });
 
 const PORT = process.env.PORT || 10000;
-server.listen(PORT, '0.0.0.0', () => console.log(`🚀 Servidor modularizado en puerto ${PORT}`));
+server.listen(PORT, '0.0.0.0', () => console.log(`🚀 Servidor en puerto ${PORT}`));

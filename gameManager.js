@@ -1,23 +1,23 @@
-// gameManager.js
 const { Chess } = require('chess.js');
 const db = require('./db');
 
 const activeGames = new Map();
-const GAME_TIME = 600; // 10 minutos
-const GRACE_TIME = 10; // 10 segundos iniciales
+const GRACE_TIME = 10; 
 
-const createGame = async (roomId, creatorWallet) => {
-    // Consultar último color para alternar
+const createGame = async (roomId, creatorWallet, initialMinutes = 10) => {
     const res = await db.query('SELECT last_color FROM users WHERE wallet = $1', [creatorWallet]);
     const lastColor = res.rows[0]?.last_color;
     const assignedColor = lastColor === 'w' ? 'b' : 'w';
+
+    const timeInSeconds = initialMinutes * 60;
 
     const gameData = {
         chess: new Chess(),
         white: assignedColor === 'w' ? creatorWallet : null,
         black: assignedColor === 'b' ? creatorWallet : null,
-        timers: { w: GAME_TIME, b: GAME_TIME },
-        lastMoveTimestamp: null,
+        timers: { w: timeInSeconds, b: timeInSeconds },
+        baseTime: timeInSeconds, // Guardamos el tiempo original de la sala
+        lastMoveTimestamp: Date.now(),
         status: 'waiting',
         moveCount: 0,
         interval: null
@@ -32,43 +32,34 @@ const handleMove = async (roomId, moveData, wallet) => {
 
     const turn = g.chess.turn();
     const authorizedWallet = turn === 'w' ? g.white : g.black;
-
     if (wallet !== authorizedWallet) return { error: "No es tu turno" };
 
     try {
-        const move = g.chess.move(moveData);
-        if (move) {
+        if (g.chess.move(moveData)) {
             const now = Date.now();
+            const elapsed = Math.floor((now - g.lastMoveTimestamp) / 1000);
             
-            // Cálculo de tiempo consumido (La verdad del servidor)
-            if (g.lastMoveTimestamp) {
-                const elapsed = Math.floor((now - g.lastMoveTimestamp) / 1000);
-                g.timers[turn] -= elapsed;
-            }
-            
+            g.timers[turn] = Math.max(0, g.timers[turn] - elapsed);
             g.lastMoveTimestamp = now;
             g.moveCount++;
 
-            // Lógica de gracia de 10 segundos
-            if (g.moveCount === 1) {
-                g.timers.w = GAME_TIME;
-                g.timers.b = GRACE_TIME;
-            } else if (g.moveCount === 2) {
-                g.timers.b = GAME_TIME;
+            // Lógica de 10s iniciales
+            if (g.moveCount === 1) { 
+                g.timers.w = g.baseTime; 
+                g.timers.b = GRACE_TIME; 
+            } else if (g.moveCount === 2) { 
+                g.timers.b = g.baseTime; 
             }
 
-            // Verificar fin de juego
             if (g.chess.isGameOver()) {
                 g.status = 'finished';
                 if (g.interval) clearInterval(g.interval);
-                // Guardar historial de colores
                 await db.query('UPDATE users SET last_color = $1 WHERE wallet = $2', ['w', g.white]);
                 await db.query('UPDATE users SET last_color = $1 WHERE wallet = $2', ['b', g.black]);
             }
-
-            return { success: true, pgn: g.chess.pgn(), timers: g.timers, status: g.status };
+            return { success: true, pgn: g.chess.pgn(), timers: g.timers, status: g.status, lastMoveTimestamp: g.lastMoveTimestamp };
         }
-    } catch (e) { return { error: "Movimiento ilegal" }; }
+    } catch (e) { return { error: "Ilegal" }; }
 };
 
 module.exports = { activeGames, createGame, handleMove, GRACE_TIME };
