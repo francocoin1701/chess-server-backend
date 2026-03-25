@@ -12,26 +12,45 @@ app.use(cors());
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" }, transports: ['websocket'] });
 
+// Función para enviar el perfil actualizado a un usuario específico
+async function syncUserProfile(wallet) {
+    try {
+        const res = await db.query(
+            `SELECT wallet, nickname, photo_url, elo, wins, losses, draws, balance_earned 
+             FROM users WHERE wallet = $1`, [wallet.toLowerCase()]
+        );
+        // Buscamos todos los sockets de esta wallet y les mandamos su nuevo perfil
+        const sockets = await io.fetchSockets();
+        for (const s of sockets) {
+            if (s.wallet === wallet.toLowerCase()) {
+                s.emit('auth_success', res.rows[0]);
+            }
+        }
+    } catch (e) { console.error("Error syncProfile:", e); }
+}
+
 async function recordResult(game, winnerColor, reason) {
     if (game.interval) clearInterval(game.interval);
     game.status = 'finished';
-    
     const { white, black } = game;
 
-    // Persistir colores
+    // 1. Actualizar colores para la próxima
     await db.query('UPDATE users SET last_color = $1 WHERE wallet = $2', ['w', white]);
     await db.query('UPDATE users SET last_color = $1 WHERE wallet = $2', ['b', black]);
 
+    // 2. Actualizar estadísticas según el resultado
     if (!winnerColor) {
-        // TABLAS: Sumamos un empate a ambos
         await db.query('UPDATE users SET draws = draws + 1 WHERE wallet IN ($1, $2)', [white, black]);
     } else {
-        // VICTORIA/DERROTA
         const winner = (winnerColor === 'w') ? white : black;
         const loser = (winnerColor === 'w') ? black : white;
         await db.query('UPDATE users SET wins = wins + 1 WHERE wallet = $1', [winner]);
         await db.query('UPDATE users SET losses = losses + 1 WHERE wallet = $1', [loser]);
     }
+
+    // 3. ENVIAR PERFILES ACTUALIZADOS A AMBOS (Para que se vea en la tarjeta)
+    await syncUserProfile(white);
+    await syncUserProfile(black);
 }
 
 io.on('connection', (socket) => {
@@ -39,11 +58,12 @@ io.on('connection', (socket) => {
         try {
             const recovered = ethers.verifyMessage(message, signature);
             if (recovered.toLowerCase() === address.toLowerCase()) {
+                const wallet = address.toLowerCase();
                 const res = await db.query(`
                     INSERT INTO users (wallet) VALUES ($1) 
                     ON CONFLICT (wallet) DO UPDATE SET wallet = EXCLUDED.wallet
-                    RETURNING wallet, nickname, photo_url, elo, wins, losses, draws`, [address.toLowerCase()]);
-                socket.wallet = address.toLowerCase();
+                    RETURNING wallet, nickname, photo_url, elo, wins, losses, draws, balance_earned`, [wallet]);
+                socket.wallet = wallet;
                 socket.emit('auth_success', res.rows[0]);
             }
         } catch (e) { socket.emit('auth_error', "Error Auth"); }
@@ -53,6 +73,10 @@ io.on('connection', (socket) => {
         if (!socket.wallet) return;
         const res = await db.query(`UPDATE users SET nickname = $1, photo_url = $2 WHERE wallet = $3 RETURNING *`, [data.nickname, data.photoUrl, socket.wallet]);
         socket.emit('auth_success', res.rows[0]);
+    });
+
+    socket.on('get_challenges', async () => {
+        socket.emit('list_challenges', await lobbyManager.getOpenChallenges());
     });
 
     socket.on('create_challenge', async (data) => {
