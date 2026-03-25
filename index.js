@@ -1,28 +1,20 @@
+// index.js completo
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
-const { Chess } = require('chess.js');
 const cors = require('cors');
 const { ethers } = require('ethers');
-const { Client } = require('pg');
+
+const db = require('./db');
+const gameManager = require('./gameManager');
 
 const app = express();
 app.use(cors());
-
-const db = new Client({
-    connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false }
-});
-db.connect().catch(e => console.error("Error DB:", e.message));
-
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" }, transports: ['websocket'] });
 
-const activeGames = new Map();
-const GAME_TIME = 600; // 10 minutos
-const START_GRACE_TIME = 10; // 10 segundos iniciales
-
 io.on('connection', (socket) => {
+    
     socket.on('auth_web3', async ({ address, signature, message }) => {
         try {
             const recovered = ethers.verifyMessage(message, signature);
@@ -38,41 +30,26 @@ io.on('connection', (socket) => {
         if (!socket.wallet) return;
         socket.join(roomId);
 
-        if (!activeGames.has(roomId)) {
-            const res = await db.query('SELECT last_color FROM users WHERE wallet = $1', [socket.wallet]);
-            const assigned = (res.rows[0]?.last_color === 'w') ? 'b' : 'w';
-
-            activeGames.set(roomId, {
-                chess: new Chess(),
-                white: assigned === 'w' ? socket.wallet : null,
-                black: assigned === 'b' ? socket.wallet : null,
-                timers: { w: GAME_TIME, b: GAME_TIME },
-                moveCount: 0,
-                lastMoveTimestamp: Date.now(),
-                status: 'waiting',
-                interval: null
-            });
+        let g = gameManager.activeGames.get(roomId);
+        if (!g) {
+            g = await gameManager.createGame(roomId, socket.wallet);
         } else {
-            const g = activeGames.get(roomId);
             if (!g.white && g.black !== socket.wallet) g.white = socket.wallet;
             else if (!g.black && g.white !== socket.wallet) g.black = socket.wallet;
 
-            // CUANDO SE UNE EL SEGUNDO JUGADOR
+            // Iniciar cronómetro si ambos están presentes
             if (g.white && g.black && g.status === 'waiting') {
                 g.status = 'active';
-                g.timers.w = START_GRACE_TIME; // Empiezan los 10s del blanco
+                g.timers.w = gameManager.GRACE_TIME;
                 g.lastMoveTimestamp = Date.now();
-                
-                // --- EL VIGILANTE DEL SERVIDOR ---
-                g.interval = setInterval(() => {
-                    if (g.status !== 'active') return;
 
+                // HEARTBEAT: Sincronización forzada cada segundo
+                g.interval = setInterval(() => {
                     const turn = g.chess.turn();
                     const now = Date.now();
                     const elapsed = Math.floor((now - g.lastMoveTimestamp) / 1000);
                     const timeLeft = g.timers[turn] - elapsed;
 
-                    // SI SE ACABA EL TIEMPO (De 10s o de 10m)
                     if (timeLeft <= 0) {
                         clearInterval(g.interval);
                         g.status = 'finished';
@@ -81,72 +58,42 @@ io.on('connection', (socket) => {
                             winner: turn === 'w' ? 'b' : 'w' 
                         });
                     } else {
-                        // Sincronización visual opcional cada segundo (puedes quitarlo para ahorrar ancho de banda)
-                        // io.to(roomId).emit('tick', { timers: { ...g.timers, [turn]: timeLeft } });
+                        // Enviamos el tiempo oficial del servidor a ambos PCs
+                        io.to(roomId).emit('tick', { 
+                            timers: { ...g.timers, [turn]: timeLeft } 
+                        });
                     }
                 }, 1000);
             }
         }
 
-        const g = activeGames.get(roomId);
         const myColor = g.white === socket.wallet ? 'w' : (g.black === socket.wallet ? 'b' : 'viewer');
-
-        io.to(roomId).emit('init_game', {
-            pgn: g.chess.pgn(),
-            white: g.white,
-            black: g.black,
-            timers: g.timers,
-            status: g.status
-        });
+        io.to(roomId).emit('init_game', { pgn: g.chess.pgn(), white: g.white, black: g.black, timers: g.timers, status: g.status });
         socket.emit('player_color', myColor);
     });
 
     socket.on('move', async ({ roomId, moveData }) => {
-        const g = activeGames.get(roomId);
-        if (!g || !socket.wallet || g.status !== 'active') return;
-
-        const turn = g.chess.turn();
-        if (socket.wallet !== (turn === 'w' ? g.white : g.black)) return;
-
-        try {
-            if (g.chess.move(moveData)) {
-                const now = Date.now();
-                const elapsed = Math.floor((now - g.lastMoveTimestamp) / 1000);
-                
-                // Descontar tiempo real del turno que acaba de mover
-                g.timers[turn] -= elapsed;
-                g.lastMoveTimestamp = now;
-                g.moveCount++;
-
-                // Lógica de transición de tiempos
-                if (g.moveCount === 1) {
-                    g.timers.w = GAME_TIME; // Blanco movió en sus 10s, ahora tiene sus 10m
-                    g.timers.b = START_GRACE_TIME; // Negro tiene sus 10s para la primera jugada
-                } else if (g.moveCount === 2) {
-                    g.timers.b = GAME_TIME; // Negro movió en sus 10s, ahora tiene sus 10m
-                }
-
-                // Si hay JAQUE MATE o tablas según el motor
-                if (g.chess.isGameOver()) {
-                    clearInterval(g.interval);
-                    g.status = 'finished';
-                    // Persistir color en DB
-                    await db.query('UPDATE users SET last_color = $1 WHERE wallet = $2', ['w', g.white]);
-                    await db.query('UPDATE users SET last_color = $1 WHERE wallet = $2', ['b', g.black]);
-                    io.to(roomId).emit('update_game', { pgn: g.chess.pgn(), timers: g.timers, status: 'finished' });
-                } else {
-                    io.to(roomId).emit('update_game', { pgn: g.chess.pgn(), timers: g.timers, status: 'active' });
-                }
-            }
-        } catch (e) { socket.emit('error_msg', "Ilegal"); }
+        const result = await gameManager.handleMove(roomId, moveData, socket.wallet);
+        if (result.error) return socket.emit('error_msg', result.error);
+        
+        io.to(roomId).emit('update_game', { 
+            pgn: result.pgn, 
+            timers: result.timers, 
+            status: result.status 
+        });
     });
 
     socket.on('reset_game', (roomId) => {
-        const g = activeGames.get(roomId);
+        const g = gameManager.activeGames.get(roomId);
         if (g && g.interval) clearInterval(g.interval);
-        activeGames.delete(roomId);
+        gameManager.activeGames.delete(roomId);
         io.to(roomId).emit('game_reset_complete');
+    });
+
+    socket.on('disconnect', () => {
+        console.log("Desconectado:", socket.id);
     });
 });
 
-server.listen(process.env.PORT || 10000, '0.0.0.0');
+const PORT = process.env.PORT || 10000;
+server.listen(PORT, '0.0.0.0', () => console.log(`🚀 Servidor modularizado en puerto ${PORT}`));
