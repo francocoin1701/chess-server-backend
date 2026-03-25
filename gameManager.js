@@ -16,7 +16,7 @@ const createGame = async (roomId, creatorWallet, initialMinutes = 10) => {
         white: assignedColor === 'w' ? creatorWallet : null,
         black: assignedColor === 'b' ? creatorWallet : null,
         timers: { w: timeInSeconds, b: timeInSeconds },
-        baseTime: timeInSeconds, // Guardamos el tiempo original de la sala
+        baseTime: timeInSeconds, 
         lastMoveTimestamp: Date.now(),
         status: 'waiting',
         moveCount: 0,
@@ -43,7 +43,7 @@ const handleMove = async (roomId, moveData, wallet) => {
             g.lastMoveTimestamp = now;
             g.moveCount++;
 
-            // Lógica de 10s iniciales
+            // Lógica de los 10s iniciales de gracia
             if (g.moveCount === 1) { 
                 g.timers.w = g.baseTime; 
                 g.timers.b = GRACE_TIME; 

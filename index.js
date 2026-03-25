@@ -29,9 +29,10 @@ io.on('connection', (socket) => {
 
         let g = gameManager.activeGames.get(roomId);
         if (!g) {
-            // El tiempo viene del frontend (1, 3, 5, 10...)
-            g = await gameManager.createGame(roomId, socket.wallet, timeLimit || 10);
+            // El primer jugador crea la sala con el tiempo elegido
+            g = await gameManager.createGame(roomId, socket.wallet, timeLimit);
         } else {
+            // El segundo jugador se une a la sala existente
             if (!g.white && g.black !== socket.wallet) g.white = socket.wallet;
             else if (!g.black && g.white !== socket.wallet) g.black = socket.wallet;
 
@@ -56,8 +57,18 @@ io.on('connection', (socket) => {
                 }, 1000);
             }
         }
+        
         const myColor = g.white === socket.wallet ? 'w' : (g.black === socket.wallet ? 'b' : 'viewer');
-        io.to(roomId).emit('init_game', { pgn: g.chess.pgn(), white: g.white, black: g.black, timers: g.timers, status: g.status, lastMoveTimestamp: g.lastMoveTimestamp });
+        
+        // Enviamos los timers REALES de la sala (g.timers) no los por defecto
+        io.to(roomId).emit('init_game', { 
+            pgn: g.chess.pgn(), 
+            white: g.white, 
+            black: g.black, 
+            timers: g.timers, 
+            status: g.status, 
+            lastMoveTimestamp: g.lastMoveTimestamp 
+        });
         socket.emit('player_color', myColor);
     });
 
