@@ -2,7 +2,7 @@ const { Chess } = require('chess.js');
 const db = require('./db');
 
 const activeGames = new Map();
-const GRACE_TIME = 10; // 10 segundos de gracia inicial
+const GRACE_TIME = 10; 
 
 const createGame = async (roomId, creatorWallet, initialMinutes) => {
     const wallet = creatorWallet.toLowerCase();
@@ -46,13 +46,10 @@ const handleMove = async (roomId, moveData, wallet) => {
             g.timers[turn] = Math.max(0, g.timers[turn] - elapsed);
             g.lastMoveTimestamp = now;
 
-            // LÓGICA DE PRESENCIA (10 SEGUNDOS)
             if (g.moveCount === 0) { 
-                // Blanco movió: recupera su tiempo base y le damos 10s al Negro
                 g.timers.w = g.baseTime; 
                 g.timers.b = GRACE_TIME; 
             } else if (g.moveCount === 1) { 
-                // Negro movió: recupera su tiempo base
                 g.timers.b = g.baseTime; 
             }
             
