@@ -12,29 +12,26 @@ app.use(cors());
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" }, transports: ['websocket'] });
 
+// Función para sincronizar estadísticas y perfil
 async function recordResult(game, winnerColor, reason) {
     if (game.interval) clearInterval(game.interval);
     game.status = 'finished';
     const { white, black } = game;
     try {
         const playersData = await db.query('SELECT wallet, elo FROM users WHERE wallet IN ($1, $2)', [white, black]);
-        const eloWhite = playersData.rows.find(r => r.wallet === white).elo;
-        const eloBlack = playersData.rows.find(r => r.wallet === black).elo;
-        let scoreWhite = winnerColor === 'w' ? 1 : (winnerColor === 'b' ? 0 : 0.5);
-        
+        const eloW = playersData.rows.find(r => r.wallet === white).elo;
+        const eloB = playersData.rows.find(r => r.wallet === black).elo;
+        let scoreW = winnerColor === 'w' ? 1 : (winnerColor === 'b' ? 0 : 0.5);
         const K = 32;
-        const expW = 1 / (1 + Math.pow(10, (eloBlack - eloWhite) / 400));
-        const expB = 1 / (1 + Math.pow(10, (eloWhite - eloBlack) / 400));
-        const newEloW = Math.round(eloWhite + K * (scoreWhite - expW));
-        const newEloB = Math.round(eloBlack + K * ((1 - scoreWhite) - expB));
+        const expW = 1 / (1 + Math.pow(10, (eloB - eloW) / 400));
+        const expB = 1 / (1 + Math.pow(10, (eloW - eloB) / 400));
+        const newEloW = Math.round(eloW + K * (scoreW - expW));
+        const newEloB = Math.round(eloB + K * ((1 - scoreW) - expB));
 
-        await db.query('UPDATE users SET last_color=$1, elo=$2, wins=wins+$3, losses=losses+$4, draws=draws+$5 WHERE wallet=$6', 
-            ['w', newEloW, scoreWhite === 1 ? 1 : 0, scoreWhite === 0 ? 1 : 0, scoreWhite === 0.5 ? 1 : 0, white]);
-        await db.query('UPDATE users SET last_color=$1, elo=$2, wins=wins+$3, losses=losses+$4, draws=draws+$5 WHERE wallet=$6', 
-            ['b', newEloB, scoreWhite === 0 ? 1 : 0, scoreWhite === 1 ? 1 : 0, scoreWhite === 0.5 ? 1 : 0, black]);
-
+        await db.query('UPDATE users SET last_color=$1, elo=$2, wins=wins+$3, losses=losses+$4, draws=draws+$5 WHERE wallet=$6', ['w', newEloW, scoreW === 1 ? 1 : 0, scoreW === 0 ? 1 : 0, scoreW === 0.5 ? 1 : 0, white]);
+        await db.query('UPDATE users SET last_color=$1, elo=$2, wins=wins+$3, losses=losses+$4, draws=draws+$5 WHERE wallet=$6', ['b', newEloB, scoreW === 0 ? 1 : 0, scoreW === 1 ? 1 : 0, scoreW === 0.5 ? 1 : 0, black]);
         syncUserProfile(white); syncUserProfile(black);
-    } catch (e) { console.error(e); }
+    } catch (e) { console.error("Error al grabar resultado:", e); }
 }
 
 async function syncUserProfile(wallet) {
@@ -43,6 +40,12 @@ async function syncUserProfile(wallet) {
         const sockets = await io.fetchSockets();
         for (const s of sockets) { if (s.wallet === wallet.toLowerCase()) s.emit('auth_success', res.rows[0]); }
     } catch (e) {}
+}
+
+// Función auxiliar para gritar la lista actualizada a todos
+async function broadcastLobbyUpdate() {
+    const list = await lobbyManager.getOpenChallenges();
+    io.emit('list_challenges', list);
 }
 
 io.on('connection', (socket) => {
@@ -68,8 +71,7 @@ io.on('connection', (socket) => {
         const roomId = `room_${Math.random().toString(36).substring(7)}`;
         if (await lobbyManager.createChallenge(socket.wallet, data.amount, data.timeLimit, roomId)) {
             await gameManager.createGame(roomId, socket.wallet, data.timeLimit);
-            // Aviso inmediato a todos para que vean la nueva apuesta
-            io.emit('list_challenges', await lobbyManager.getOpenChallenges());
+            broadcastLobbyUpdate(); // Aviso global
             socket.emit('challenge_created', { roomId });
         }
     });
@@ -81,8 +83,7 @@ io.on('connection', (socket) => {
             const joiner = socket.wallet.toLowerCase();
             if (!g.white) g.white = joiner; else g.black = joiner;
             io.emit('challenge_accepted_global', { roomId, joiner });
-            // Aviso inmediato para quitar la apuesta de la lista global
-            io.emit('list_challenges', await lobbyManager.getOpenChallenges());
+            broadcastLobbyUpdate(); // Quitar de la lista global
         }
     });
 
@@ -90,7 +91,6 @@ io.on('connection', (socket) => {
         const g = gameManager.activeGames.get(roomId);
         if (!g) return;
         socket.join(roomId);
-
         if (g.white && g.black && g.status === 'waiting') {
             g.status = 'active'; g.timers.w = gameManager.GRACE_TIME; g.lastMoveTimestamp = Date.now();
             g.interval = setInterval(async () => {
@@ -100,7 +100,7 @@ io.on('connection', (socket) => {
                     const winner = turn === 'w' ? 'b' : 'w';
                     await recordResult(g, winner, 'timeout');
                     io.to(roomId).emit('game_over', { reason: g.moveCount < 2 ? 'timeout_start' : 'timeout', winner });
-                    lobbyManager.updateChallengeStatus(roomId, 'finished');
+                    await lobbyManager.updateChallengeStatus(roomId, 'finished');
                 } else {
                     io.to(roomId).emit('tick', { timers: g.timers, turn, lastMoveTimestamp: g.lastMoveTimestamp });
                 }
@@ -115,29 +115,39 @@ io.on('connection', (socket) => {
         if (result.error) return socket.emit('error_msg', result.error);
         if (result.status === 'finished') {
             await recordResult(gameManager.activeGames.get(roomId), result.winner, result.reason);
-            lobbyManager.updateChallengeStatus(roomId, 'finished');
+            await lobbyManager.updateChallengeStatus(roomId, 'finished');
             io.to(roomId).emit('game_over', { reason: result.reason, winner: result.winner });
         }
         io.to(roomId).emit('update_game', { pgn: result.pgn, timers: result.timers, status: result.status, lastMoveTimestamp: result.lastMoveTimestamp });
     });
 
-    // --- CORRECCIÓN SENTIDO COMÚN: CANCELACIÓN REAL ---
+    // --- CORRECCIÓN DEFINITIVA DE CANCELACIÓN ---
     socket.on('reset_game', async (roomId) => {
+        console.log(`Solicitud de cancelación para sala: ${roomId}`);
+        
+        // 1. Limpiar memoria RAM del servidor
         const g = gameManager.activeGames.get(roomId);
         if (g) {
             if (g.interval) clearInterval(g.interval);
             gameManager.activeGames.delete(roomId);
-            // Marcar como cancelada en la DB para que desaparezca del lobby
-            await lobbyManager.updateChallengeStatus(roomId, 'cancelled');
-            console.log(`🚫 Apuesta ${roomId} cancelada por el usuario.`);
         }
         
-        // GRITAR A TODOS que la apuesta ya no existe
+        // 2. Limpiar Base de Datos (Esto es lo que quita la apuesta del lobby)
+        if (roomId) {
+            await lobbyManager.updateChallengeStatus(roomId, 'cancelled');
+        }
+
+        // 3. AVISO GLOBAL OBLIGATORIO: Se emite a TODOS los sockets conectados
         const updatedList = await lobbyManager.getOpenChallenges();
         io.emit('list_challenges', updatedList);
         
-        // Sacar al usuario al lobby
+        // 4. Devolver al usuario al lobby
         socket.emit('game_reset_complete');
+    });
+
+    // Limpieza automática si alguien cierra el navegador
+    socket.on('disconnect', () => {
+        console.log("Un usuario se ha desconectado");
     });
 });
 
