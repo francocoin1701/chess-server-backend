@@ -12,7 +12,6 @@ app.use(cors());
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" }, transports: ['websocket'] });
 
-// Función para sincronizar estadísticas y perfil
 async function recordResult(game, winnerColor, reason) {
     if (game.interval) clearInterval(game.interval);
     game.status = 'finished';
@@ -48,14 +47,14 @@ async function broadcastLobbyUpdate() {
 }
 
 io.on('connection', (socket) => {
-    console.log('Nueva conexión física:', socket.id);
+    console.log('🔗 Conexión establecida:', socket.id);
 
-    // --- RE-AUTENTICACIÓN AUTOMÁTICA (Para evitar el Limbo) ---
+    // --- RE-AUTENTICACIÓN (EL MOTOR CONTRA EL LIMBO) ---
     socket.on('reauth', async (wallet) => {
         if (!wallet) return;
         const cleanWallet = wallet.toLowerCase();
-        socket.wallet = cleanWallet;
-        console.log(`Re-vinculando socket ${socket.id} a wallet ${cleanWallet}`);
+        socket.wallet = cleanWallet; // VINCULACIÓN INMEDIATA
+        console.log(`♻️ Re-vinculado: ${cleanWallet}`);
         const res = await db.query(`SELECT * FROM users WHERE wallet = $1`, [cleanWallet]);
         if (res.rows.length > 0) {
             socket.emit('auth_success', res.rows[0]);
@@ -71,7 +70,7 @@ io.on('connection', (socket) => {
                 socket.wallet = wallet; 
                 socket.emit('auth_success', res.rows[0]);
             }
-        } catch (e) { socket.emit('auth_error', "Error Auth"); }
+        } catch (e) { socket.emit('auth_error', "Falla en firma"); }
     });
 
     socket.on('get_challenges', async () => {
@@ -81,17 +80,24 @@ io.on('connection', (socket) => {
     });
 
     socket.on('create_challenge', async (data) => {
-        if (!socket.wallet) return;
+        console.log("Intentando crear apuesta para wallet:", socket.wallet);
+        if (!socket.wallet) return socket.emit('error_msg', "Sesión perdida. Recarga la página.");
+        
         const roomId = `room_${Math.random().toString(36).substring(7)}`;
-        if (await lobbyManager.createChallenge(socket.wallet, data.amount, data.timeLimit, roomId)) {
+        const challenge = await lobbyManager.createChallenge(socket.wallet, data.amount, data.timeLimit, roomId);
+        
+        if (challenge) {
             await gameManager.createGame(roomId, socket.wallet, data.timeLimit);
+            console.log("✅ Apuesta creada:", roomId);
             broadcastLobbyUpdate();
             socket.emit('challenge_created', { roomId });
+        } else {
+            socket.emit('error_msg', "No se pudo guardar la apuesta en DB");
         }
     });
 
     socket.on('accept_challenge', async (roomId) => {
-        if (!socket.wallet) return;
+        if (!socket.wallet) return socket.emit('error_msg', "Sesión perdida.");
         const g = gameManager.activeGames.get(roomId);
         if (g && await lobbyManager.updateChallengeStatus(roomId, 'playing')) {
             const joiner = socket.wallet.toLowerCase();
@@ -144,10 +150,6 @@ io.on('connection', (socket) => {
         if (roomId) await lobbyManager.updateChallengeStatus(roomId, 'cancelled');
         broadcastLobbyUpdate();
         socket.emit('game_reset_complete');
-    });
-
-    socket.on('disconnect', () => {
-        console.log('Socket desconectado:', socket.id);
     });
 });
 
