@@ -42,27 +42,41 @@ async function syncUserProfile(wallet) {
     } catch (e) {}
 }
 
-// Función auxiliar para gritar la lista actualizada a todos
 async function broadcastLobbyUpdate() {
     const list = await lobbyManager.getOpenChallenges();
     io.emit('list_challenges', list);
 }
 
 io.on('connection', (socket) => {
+    console.log('Nueva conexión física:', socket.id);
+
+    // --- RE-AUTENTICACIÓN AUTOMÁTICA (Para evitar el Limbo) ---
+    socket.on('reauth', async (wallet) => {
+        if (!wallet) return;
+        const cleanWallet = wallet.toLowerCase();
+        socket.wallet = cleanWallet;
+        console.log(`Re-vinculando socket ${socket.id} a wallet ${cleanWallet}`);
+        const res = await db.query(`SELECT * FROM users WHERE wallet = $1`, [cleanWallet]);
+        if (res.rows.length > 0) {
+            socket.emit('auth_success', res.rows[0]);
+        }
+    });
+
     socket.on('auth_web3', async ({ address, signature, message }) => {
         try {
             const recovered = ethers.verifyMessage(message, signature);
             if (recovered.toLowerCase() === address.toLowerCase()) {
                 const wallet = address.toLowerCase();
                 const res = await db.query(`INSERT INTO users (wallet) VALUES ($1) ON CONFLICT (wallet) DO UPDATE SET wallet = EXCLUDED.wallet RETURNING *`, [wallet]);
-                socket.wallet = wallet; socket.emit('auth_success', res.rows[0]);
+                socket.wallet = wallet; 
+                socket.emit('auth_success', res.rows[0]);
             }
         } catch (e) { socket.emit('auth_error', "Error Auth"); }
     });
 
     socket.on('get_challenges', async () => {
         socket.emit('list_challenges', await lobbyManager.getOpenChallenges());
-        const live = await db.query("SELECT c.*, u1.nickname as white_nick, u2.nickname as black_nick FROM challenges c JOIN users u1 ON c.creator_wallet = u1.wallet LEFT JOIN users u2 ON c.room_id = u2.wallet WHERE c.status = 'playing' LIMIT 10");
+        const live = await db.query("SELECT c.*, u1.nickname as white_nick, u2.nickname as black_nick FROM challenges c JOIN users u1 ON c.creator_wallet = u1.wallet LEFT JOIN users u2 ON u2.room_id = u2.wallet WHERE c.status = 'playing' LIMIT 10");
         socket.emit('list_live_games', live.rows);
     });
 
@@ -71,7 +85,7 @@ io.on('connection', (socket) => {
         const roomId = `room_${Math.random().toString(36).substring(7)}`;
         if (await lobbyManager.createChallenge(socket.wallet, data.amount, data.timeLimit, roomId)) {
             await gameManager.createGame(roomId, socket.wallet, data.timeLimit);
-            broadcastLobbyUpdate(); // Aviso global
+            broadcastLobbyUpdate();
             socket.emit('challenge_created', { roomId });
         }
     });
@@ -83,7 +97,7 @@ io.on('connection', (socket) => {
             const joiner = socket.wallet.toLowerCase();
             if (!g.white) g.white = joiner; else g.black = joiner;
             io.emit('challenge_accepted_global', { roomId, joiner });
-            broadcastLobbyUpdate(); // Quitar de la lista global
+            broadcastLobbyUpdate();
         }
     });
 
@@ -121,33 +135,19 @@ io.on('connection', (socket) => {
         io.to(roomId).emit('update_game', { pgn: result.pgn, timers: result.timers, status: result.status, lastMoveTimestamp: result.lastMoveTimestamp });
     });
 
-    // --- CORRECCIÓN DEFINITIVA DE CANCELACIÓN ---
     socket.on('reset_game', async (roomId) => {
-        console.log(`Solicitud de cancelación para sala: ${roomId}`);
-        
-        // 1. Limpiar memoria RAM del servidor
         const g = gameManager.activeGames.get(roomId);
         if (g) {
             if (g.interval) clearInterval(g.interval);
             gameManager.activeGames.delete(roomId);
         }
-        
-        // 2. Limpiar Base de Datos (Esto es lo que quita la apuesta del lobby)
-        if (roomId) {
-            await lobbyManager.updateChallengeStatus(roomId, 'cancelled');
-        }
-
-        // 3. AVISO GLOBAL OBLIGATORIO: Se emite a TODOS los sockets conectados
-        const updatedList = await lobbyManager.getOpenChallenges();
-        io.emit('list_challenges', updatedList);
-        
-        // 4. Devolver al usuario al lobby
+        if (roomId) await lobbyManager.updateChallengeStatus(roomId, 'cancelled');
+        broadcastLobbyUpdate();
         socket.emit('game_reset_complete');
     });
 
-    // Limpieza automática si alguien cierra el navegador
     socket.on('disconnect', () => {
-        console.log("Un usuario se ha desconectado");
+        console.log('Socket desconectado:', socket.id);
     });
 });
 
