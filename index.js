@@ -12,6 +12,20 @@ app.use(cors());
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" }, transports: ['websocket'] });
 
+// Sincronizar perfil de forma eficiente
+async function syncUserProfile(wallet) {
+    try {
+        const res = await db.query(`SELECT * FROM users WHERE wallet = $1`, [wallet.toLowerCase()]);
+        if (res.rows.length > 0) {
+            // Buscamos solo a los sockets que tengan esta wallet para no recorrer todos
+            const sockets = await io.fetchSockets();
+            sockets.forEach(s => {
+                if (s.wallet === wallet.toLowerCase()) s.emit('auth_success', res.rows[0]);
+            });
+        }
+    } catch (e) { console.error("Error syncProfile:", e); }
+}
+
 async function recordResult(game, winnerColor, reason) {
     if (game.interval) clearInterval(game.interval);
     game.status = 'finished';
@@ -21,6 +35,7 @@ async function recordResult(game, winnerColor, reason) {
         const eloW = playersData.rows.find(r => r.wallet === white).elo;
         const eloB = playersData.rows.find(r => r.wallet === black).elo;
         let scoreW = winnerColor === 'w' ? 1 : (winnerColor === 'b' ? 0 : 0.5);
+        
         const K = 32;
         const expW = 1 / (1 + Math.pow(10, (eloB - eloW) / 400));
         const expB = 1 / (1 + Math.pow(10, (eloW - eloB) / 400));
@@ -29,36 +44,28 @@ async function recordResult(game, winnerColor, reason) {
 
         await db.query('UPDATE users SET last_color=$1, elo=$2, wins=wins+$3, losses=losses+$4, draws=draws+$5 WHERE wallet=$6', ['w', newEloW, scoreW === 1 ? 1 : 0, scoreW === 0 ? 1 : 0, scoreW === 0.5 ? 1 : 0, white]);
         await db.query('UPDATE users SET last_color=$1, elo=$2, wins=wins+$3, losses=losses+$4, draws=draws+$5 WHERE wallet=$6', ['b', newEloB, scoreW === 0 ? 1 : 0, scoreW === 1 ? 1 : 0, scoreW === 0.5 ? 1 : 0, black]);
-        syncUserProfile(white); syncUserProfile(black);
-    } catch (e) { console.error("Error al grabar resultado:", e); }
-}
-
-async function syncUserProfile(wallet) {
-    try {
-        const res = await db.query(`SELECT * FROM users WHERE wallet = $1`, [wallet.toLowerCase()]);
-        const sockets = await io.fetchSockets();
-        for (const s of sockets) { if (s.wallet === wallet.toLowerCase()) s.emit('auth_success', res.rows[0]); }
-    } catch (e) {}
+        
+        await syncUserProfile(white);
+        await syncUserProfile(black);
+    } catch (e) { console.error("Error recordResult:", e); }
 }
 
 async function broadcastLobbyUpdate() {
-    const list = await lobbyManager.getOpenChallenges();
-    io.emit('list_challenges', list);
+    try {
+        const list = await lobbyManager.getOpenChallenges();
+        io.emit('list_challenges', list);
+    } catch (e) { console.error("Error broadcast:", e); }
 }
 
 io.on('connection', (socket) => {
-    console.log('🔗 Conexión establecida:', socket.id);
+    console.log('🔗 Socket conectado:', socket.id);
 
-    // --- RE-AUTENTICACIÓN (EL MOTOR CONTRA EL LIMBO) ---
     socket.on('reauth', async (wallet) => {
         if (!wallet) return;
         const cleanWallet = wallet.toLowerCase();
-        socket.wallet = cleanWallet; // VINCULACIÓN INMEDIATA
-        console.log(`♻️ Re-vinculado: ${cleanWallet}`);
+        socket.wallet = cleanWallet;
         const res = await db.query(`SELECT * FROM users WHERE wallet = $1`, [cleanWallet]);
-        if (res.rows.length > 0) {
-            socket.emit('auth_success', res.rows[0]);
-        }
+        if (res.rows.length > 0) socket.emit('auth_success', res.rows[0]);
     });
 
     socket.on('auth_web3', async ({ address, signature, message }) => {
@@ -67,37 +74,41 @@ io.on('connection', (socket) => {
             if (recovered.toLowerCase() === address.toLowerCase()) {
                 const wallet = address.toLowerCase();
                 const res = await db.query(`INSERT INTO users (wallet) VALUES ($1) ON CONFLICT (wallet) DO UPDATE SET wallet = EXCLUDED.wallet RETURNING *`, [wallet]);
-                socket.wallet = wallet; 
+                socket.wallet = wallet;
                 socket.emit('auth_success', res.rows[0]);
             }
-        } catch (e) { socket.emit('auth_error', "Falla en firma"); }
+        } catch (e) { socket.emit('auth_error', "Error firma"); }
     });
 
     socket.on('get_challenges', async () => {
-        socket.emit('list_challenges', await lobbyManager.getOpenChallenges());
-        const live = await db.query("SELECT c.*, u1.nickname as white_nick, u2.nickname as black_nick FROM challenges c JOIN users u1 ON c.creator_wallet = u1.wallet LEFT JOIN users u2 ON u2.room_id = u2.wallet WHERE c.status = 'playing' LIMIT 10");
-        socket.emit('list_live_games', live.rows);
+        try {
+            // Enviamos apuestas abiertas
+            socket.emit('list_challenges', await lobbyManager.getOpenChallenges());
+            
+            // CORRECCIÓN SQL: Solo traemos la info básica para no romper el servidor
+            const live = await db.query(`
+                SELECT c.room_id, u.nickname as white_nick 
+                FROM challenges c 
+                JOIN users u ON c.creator_wallet = u.wallet 
+                WHERE c.status = 'playing' 
+                LIMIT 10
+            `);
+            socket.emit('list_live_games', live.rows);
+        } catch (e) { console.error("Error en get_challenges:", e); }
     });
 
     socket.on('create_challenge', async (data) => {
-        console.log("Intentando crear apuesta para wallet:", socket.wallet);
-        if (!socket.wallet) return socket.emit('error_msg', "Sesión perdida. Recarga la página.");
-        
+        if (!socket.wallet) return socket.emit('error_msg', "Sesión no iniciada");
         const roomId = `room_${Math.random().toString(36).substring(7)}`;
-        const challenge = await lobbyManager.createChallenge(socket.wallet, data.amount, data.timeLimit, roomId);
-        
-        if (challenge) {
+        if (await lobbyManager.createChallenge(socket.wallet, data.amount, data.timeLimit, roomId)) {
             await gameManager.createGame(roomId, socket.wallet, data.timeLimit);
-            console.log("✅ Apuesta creada:", roomId);
             broadcastLobbyUpdate();
             socket.emit('challenge_created', { roomId });
-        } else {
-            socket.emit('error_msg', "No se pudo guardar la apuesta en DB");
         }
     });
 
     socket.on('accept_challenge', async (roomId) => {
-        if (!socket.wallet) return socket.emit('error_msg', "Sesión perdida.");
+        if (!socket.wallet) return;
         const g = gameManager.activeGames.get(roomId);
         if (g && await lobbyManager.updateChallengeStatus(roomId, 'playing')) {
             const joiner = socket.wallet.toLowerCase();
@@ -134,7 +145,8 @@ io.on('connection', (socket) => {
         const result = await gameManager.handleMove(roomId, moveData, socket.wallet);
         if (result.error) return socket.emit('error_msg', result.error);
         if (result.status === 'finished') {
-            await recordResult(gameManager.activeGames.get(roomId), result.winner, result.reason);
+            const gameObj = gameManager.activeGames.get(roomId);
+            await recordResult(gameObj, result.winner, result.reason);
             await lobbyManager.updateChallengeStatus(roomId, 'finished');
             io.to(roomId).emit('game_over', { reason: result.reason, winner: result.winner });
         }
