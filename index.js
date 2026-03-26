@@ -12,69 +12,35 @@ app.use(cors());
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" }, transports: ['websocket'] });
 
-// --- LÓGICA DE ELO REAL ---
-function getNewRatings(ratingA, ratingB, scoreA) {
-    const K = 32; // Factor de sensibilidad
-    const expectedA = 1 / (1 + Math.pow(10, (ratingB - ratingA) / 400));
-    const expectedB = 1 / (1 + Math.pow(10, (ratingA - ratingB) / 400));
-    
-    const scoreB = 1 - scoreA; // Si A gana (1), B pierde (0). Si es tablas, ambos 0.5.
-    
-    return {
-        newA: Math.round(ratingA + K * (scoreA - expectedA)),
-        newB: Math.round(ratingB + K * (scoreB - expectedB))
-    };
-}
-
-async function syncUserProfile(wallet) {
-    try {
-        const res = await db.query(
-            `SELECT wallet, nickname, photo_url, elo, wins, losses, draws, balance_earned 
-             FROM users WHERE wallet = $1`, [wallet.toLowerCase()]
-        );
-        const sockets = await io.fetchSockets();
-        for (const s of sockets) {
-            if (s.wallet === wallet.toLowerCase()) s.emit('auth_success', res.rows[0]);
-        }
-    } catch (e) { console.error("Error syncProfile:", e); }
-}
-
 async function recordResult(game, winnerColor, reason) {
     if (game.interval) clearInterval(game.interval);
     game.status = 'finished';
     const { white, black } = game;
-
     try {
-        // 1. Obtener Elos actuales de la DB
         const playersData = await db.query('SELECT wallet, elo FROM users WHERE wallet IN ($1, $2)', [white, black]);
         const eloWhite = playersData.rows.find(r => r.wallet === white).elo;
         const eloBlack = playersData.rows.find(r => r.wallet === black).elo;
-
-        // 2. Definir score (1: Gana blancas, 0: Gana negras, 0.5: Tablas)
-        let scoreWhite = 0.5;
-        if (winnerColor === 'w') scoreWhite = 1;
-        if (winnerColor === 'b') scoreWhite = 0;
-
-        // 3. Calcular nuevos Elos
-        const { newA: newEloWhite, newB: newEloBlack } = getNewRatings(eloWhite, eloBlack, scoreWhite);
-
-        // 4. Actualizar DB (Estadísticas + Nuevo Elo)
-        if (scoreWhite === 1) {
-            await db.query('UPDATE users SET wins = wins + 1, elo = $1, last_color = $2 WHERE wallet = $3', [newEloWhite, 'w', white]);
-            await db.query('UPDATE users SET losses = losses + 1, elo = $1, last_color = $2 WHERE wallet = $3', [newEloBlack, 'b', black]);
-        } else if (scoreWhite === 0) {
-            await db.query('UPDATE users SET wins = wins + 1, elo = $1, last_color = $2 WHERE wallet = $3', [newEloBlack, 'b', black]);
-            await db.query('UPDATE users SET losses = losses + 1, elo = $1, last_color = $2 WHERE wallet = $3', [newEloWhite, 'w', white]);
-        } else {
-            await db.query('UPDATE users SET draws = draws + 1, elo = $1, last_color = $2 WHERE wallet = $3', [newEloWhite, 'w', white]);
-            await db.query('UPDATE users SET draws = draws + 1, elo = $1, last_color = $2 WHERE wallet = $3', [newEloBlack, 'b', black]);
-        }
-
-        // 5. Sincronizar perfiles
-        await syncUserProfile(white);
-        await syncUserProfile(black);
+        let scoreWhite = winnerColor === 'w' ? 1 : (winnerColor === 'b' ? 0 : 0.5);
         
-    } catch (err) { console.error("Error actualizando resultado/elo:", err); }
+        const K = 32;
+        const expW = 1 / (1 + Math.pow(10, (eloBlack - eloWhite) / 400));
+        const expB = 1 / (1 + Math.pow(10, (eloWhite - eloBlack) / 400));
+        const newEloW = Math.round(eloWhite + K * (scoreWhite - expW));
+        const newEloB = Math.round(eloBlack + K * ((1 - scoreWhite) - expB));
+
+        await db.query('UPDATE users SET last_color=$1, elo=$2, wins=wins+$3, losses=losses+$4, draws=draws+$5 WHERE wallet=$6', 
+            ['w', newEloW, scoreWhite === 1 ? 1 : 0, scoreWhite === 0 ? 1 : 0, scoreWhite === 0.5 ? 1 : 0, white]);
+        await db.query('UPDATE users SET last_color=$1, elo=$2, wins=wins+$3, losses=losses+$4, draws=draws+$5 WHERE wallet=$6', 
+            ['b', newEloB, scoreWhite === 0 ? 1 : 0, scoreWhite === 1 ? 1 : 0, scoreWhite === 0.5 ? 1 : 0, black]);
+
+        syncUserProfile(white); syncUserProfile(black);
+    } catch (e) { console.error(e); }
+}
+
+async function syncUserProfile(wallet) {
+    const res = await db.query(`SELECT * FROM users WHERE wallet = $1`, [wallet.toLowerCase()]);
+    const sockets = await io.fetchSockets();
+    for (const s of sockets) { if (s.wallet === wallet.toLowerCase()) s.emit('auth_success', res.rows[0]); }
 }
 
 io.on('connection', (socket) => {
@@ -83,24 +49,18 @@ io.on('connection', (socket) => {
             const recovered = ethers.verifyMessage(message, signature);
             if (recovered.toLowerCase() === address.toLowerCase()) {
                 const wallet = address.toLowerCase();
-                const res = await db.query(`
-                    INSERT INTO users (wallet) VALUES ($1) 
-                    ON CONFLICT (wallet) DO UPDATE SET wallet = EXCLUDED.wallet
-                    RETURNING wallet, nickname, photo_url, elo, wins, losses, draws, balance_earned`, [wallet]);
-                socket.wallet = wallet;
-                socket.emit('auth_success', res.rows[0]);
+                const res = await db.query(`INSERT INTO users (wallet) VALUES ($1) ON CONFLICT (wallet) DO UPDATE SET wallet = EXCLUDED.wallet RETURNING *`, [wallet]);
+                socket.wallet = wallet; socket.emit('auth_success', res.rows[0]);
             }
         } catch (e) { socket.emit('auth_error', "Error Auth"); }
     });
 
-    socket.on('update_profile', async (data) => {
-        if (!socket.wallet) return;
-        const res = await db.query(`UPDATE users SET nickname = $1, photo_url = $2 WHERE wallet = $3 RETURNING *`, [data.nickname, data.photoUrl, socket.wallet]);
-        socket.emit('auth_success', res.rows[0]);
-    });
-
+    // --- LÓGICA LOBBY ---
     socket.on('get_challenges', async () => {
         socket.emit('list_challenges', await lobbyManager.getOpenChallenges());
+        // También enviamos las partidas en vivo
+        const live = await db.query("SELECT c.*, u1.nickname as white_nick, u2.nickname as black_nick FROM challenges c JOIN users u1 ON c.creator_wallet = u1.wallet LEFT JOIN users u2 ON u2.wallet != u1.wallet WHERE c.status = 'playing' LIMIT 10");
+        socket.emit('list_live_games', live.rows);
     });
 
     socket.on('create_challenge', async (data) => {
@@ -124,14 +84,15 @@ io.on('connection', (socket) => {
         }
     });
 
+    // --- LÓGICA JUEGO / ESPECTADOR ---
     socket.on('join_room', async ({ roomId }) => {
         const g = gameManager.activeGames.get(roomId);
-        if (!g || !socket.wallet) return;
+        if (!g) return;
         socket.join(roomId);
+
+        // Si entran los dos jugadores reales, iniciar reloj
         if (g.white && g.black && g.status === 'waiting') {
-            g.status = 'active';
-            g.timers.w = gameManager.GRACE_TIME; 
-            g.lastMoveTimestamp = Date.now();
+            g.status = 'active'; g.timers.w = gameManager.GRACE_TIME; g.lastMoveTimestamp = Date.now();
             g.interval = setInterval(async () => {
                 const turn = g.chess.turn();
                 const timeLeft = g.timers[turn] - Math.floor((Date.now() - g.lastMoveTimestamp) / 1000);
@@ -145,7 +106,14 @@ io.on('connection', (socket) => {
                 }
             }, 1000);
         }
-        socket.emit('player_color', g.white === socket.wallet ? 'w' : 'b');
+
+        // Determinar rol: 'w', 'b' o 'viewer'
+        const myWallet = socket.wallet?.toLowerCase();
+        let role = 'viewer';
+        if (myWallet === g.white) role = 'w';
+        else if (myWallet === g.black) role = 'b';
+
+        socket.emit('player_color', role);
         io.to(roomId).emit('init_game', { pgn: g.chess.pgn(), white: g.white, black: g.black, timers: g.timers, status: g.status, lastMoveTimestamp: g.lastMoveTimestamp });
     });
 
