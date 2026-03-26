@@ -4,7 +4,7 @@ const db = require('./db');
 const activeGames = new Map();
 const GRACE_TIME = 10; 
 
-const createGame = async (roomId, creatorWallet, initialMinutes) => {
+const createGame = async (roomId, creatorWallet, initialMinutes, blockchainId) => {
     const wallet = creatorWallet.toLowerCase();
     const mins = (initialMinutes && initialMinutes > 0) ? initialMinutes : 10;
     const timeInSeconds = mins * 60;
@@ -22,6 +22,7 @@ const createGame = async (roomId, creatorWallet, initialMinutes) => {
         lastMoveTimestamp: Date.now(),
         status: 'waiting',
         moveCount: 0,
+        blockchainId: blockchainId, // <--- Vínculo vital con la red
         interval: null
     };
     activeGames.set(roomId, gameData);
@@ -46,16 +47,14 @@ const handleMove = async (roomId, moveData, wallet) => {
             else if (g.moveCount === 1) { g.timers.b = g.baseTime; }
             g.moveCount++;
 
-            // DETECCIÓN INTEGRAL DE FIN DE JUEGO
             if (g.chess.isGameOver()) {
                 g.status = 'finished';
                 let result = { status: 'finished', pgn: g.chess.pgn(), timers: g.timers };
-                
                 if (g.chess.isCheckmate()) {
                     result.reason = 'checkmate';
-                    result.winner = turn; // Quien movió y dio mate
+                    result.winner = turn;
                 } else {
-                    result.reason = 'draw'; // Stalemate, repetition, etc.
+                    result.reason = 'draw';
                     result.winner = null;
                 }
                 return result;

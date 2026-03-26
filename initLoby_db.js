@@ -1,10 +1,10 @@
 const { Client } = require('pg');
 
-// Tu URL externa de Render
-const connectionString = "postgresql://chess_db_sftz_user:lPvCajK6CDsusmqTxcEhXbjNOCzAfBMx@dpg-d70rmd3uibrs738u21s0-a.oregon-postgres.render.com/chess_db_sftz";
+// ⚠️ Mejor usar variable de entorno (seguridad)
+const connectionString = process.env.DATABASE_URL || "postgresql://chess_db_sftz_user:lPvCajK6CDsusmqTxcEhXbjNOCzAfBMx@dpg-d70rmd3uibrs738u21s0-a.oregon-postgres.render.com/chess_db_sftz";
 
 const client = new Client({
-    connectionString: connectionString,
+    connectionString,
     ssl: { rejectUnauthorized: false }
 });
 
@@ -13,18 +13,19 @@ async function actualizarTerreno() {
         await client.connect();
         console.log("✅ Conexión establecida. Optimizando base de datos...");
 
-        // 1. AMPLIAR TABLA DE USUARIOS (Solo lo que no tenemos)
-        // No tocamos wallet, nickname, elo ni last_color porque YA ESTÁN AHÍ.
+        // 🔥 TRANSACTION (MUY IMPORTANTE)
+        await client.query('BEGIN');
+
+        // 1. USERS
         await client.query(`
             ALTER TABLE users 
             ADD COLUMN IF NOT EXISTS wins INT DEFAULT 0,
             ADD COLUMN IF NOT EXISTS losses INT DEFAULT 0,
             ADD COLUMN IF NOT EXISTS balance_earned TEXT DEFAULT '0';
         `);
-        console.log("1. ✅ Estadísticas añadidas a la tabla 'users'.");
+        console.log("1. ✅ Estadísticas añadidas a 'users'.");
 
-        // 2. TABLA DE DESAFÍOS (Lobby)
-        // Solo guardamos la wallet. El nickname lo traeremos con un "JOIN" en el código.
+        // 2. CHALLENGES
         await client.query(`
             CREATE TABLE IF NOT EXISTS challenges (
                 id SERIAL PRIMARY KEY,
@@ -32,33 +33,50 @@ async function actualizarTerreno() {
                 bet_amount TEXT NOT NULL,
                 time_limit INT NOT NULL,
                 room_id TEXT UNIQUE NOT NULL,
-                status TEXT DEFAULT 'open', -- 'open', 'playing', 'cancelled'
+                status TEXT DEFAULT 'open',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         `);
-        console.log("2. ✅ Tabla de Desafíos (Lobby) vinculada.");
+        console.log("2. ✅ Tabla 'challenges' lista.");
 
-        // 3. TABLA DE HISTORIAL (Recibos)
-        // Guardamos el resultado final para que sea permanente.
+        // 🔥 blockchain_id (tu cambio clave)
+        await client.query(`
+            ALTER TABLE challenges
+            ADD COLUMN IF NOT EXISTS blockchain_id INTEGER UNIQUE;
+        `);
+        console.log("2.1. ✅ blockchain_id añadido.");
+
+        // 🔥 índice extra (PRO rendimiento)
+        await client.query(`
+            CREATE INDEX IF NOT EXISTS idx_challenges_blockchain_id 
+            ON challenges(blockchain_id);
+        `);
+
+        // 3. GAME HISTORY
         await client.query(`
             CREATE TABLE IF NOT EXISTS game_history (
                 id SERIAL PRIMARY KEY,
                 room_id TEXT NOT NULL,
                 white_wallet TEXT NOT NULL REFERENCES users(wallet),
                 black_wallet TEXT NOT NULL REFERENCES users(wallet),
-                winner_wallet TEXT, -- wallet o NULL si es tablas
+                winner_wallet TEXT,
                 bet_amount TEXT NOT NULL,
                 pgn TEXT,
                 played_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         `);
-        console.log("3. ✅ Tabla de Historial vinculada.");
+        console.log("3. ✅ Tabla 'game_history' lista.");
+
+        // ✅ TODO OK
+        await client.query('COMMIT');
+        console.log("🎉 Migración completada correctamente.");
 
     } catch (err) {
-        console.error("❌ Error de lógica en la DB:", err);
+        await client.query('ROLLBACK'); // 🔥 importante
+        console.error("❌ Error en la DB:", err);
     } finally {
         await client.end();
-        console.log("🏁 Base de Datos optimizada. Cimientos listos.");
+        console.log("🏁 Proceso terminado.");
     }
 }
 

@@ -1,33 +1,31 @@
-// lobbyManager.js
 const db = require('./db');
 
 /**
- * Crea una nueva apuesta en la base de datos
+ * Crea una nueva apuesta en la base de datos vinculada al ID de la Blockchain
  */
-const createChallenge = async (wallet, amount, timeLimit, roomId) => {
+const createChallenge = async (wallet, amount, timeLimit, roomId, blockchainId) => {
     try {
         const res = await db.query(
-            `INSERT INTO challenges (creator_wallet, bet_amount, time_limit, room_id, status) 
-             VALUES ($1, $2, $3, $4, 'open') RETURNING *`,
-            [wallet, amount, timeLimit, roomId]
+            `INSERT INTO challenges (creator_wallet, bet_amount, time_limit, room_id, status, blockchain_id) 
+             VALUES ($1, $2, $3, $4, 'open', $5) RETURNING *`,
+            [wallet.toLowerCase(), amount.toString(), timeLimit, roomId, blockchainId]
         );
         return res.rows[0];
     } catch (e) {
-        console.error("Error al crear desafío:", e.message);
+        console.error("Error al crear desafío en DB:", e.message);
         return null;
     }
 };
 
 /**
  * Obtiene todas las apuestas abiertas.
- * SENTIDO COMÚN: Usamos JOIN para traer el nickname y el ELO del creador 
- * desde la tabla 'users' sin tener que guardarlos dos veces.
  */
 const getOpenChallenges = async () => {
     try {
         const res = await db.query(`
             SELECT 
                 c.id, 
+                c.blockchain_id, 
                 c.creator_wallet, 
                 c.bet_amount, 
                 c.time_limit, 
@@ -47,7 +45,7 @@ const getOpenChallenges = async () => {
 };
 
 /**
- * Actualiza el estado de una apuesta (ej: de 'open' a 'playing')
+ * Actualiza el estado de una apuesta
  */
 const updateChallengeStatus = async (roomId, newStatus) => {
     try {

@@ -12,16 +12,18 @@ app.use(cors());
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" }, transports: ['websocket'] });
 
-// Sincronizar perfil de forma eficiente
+// 1. CONFIGURACIÓN BLOCKCHAIN (LECTOR)
+const provider = new ethers.JsonRpcProvider("https://ethereum-sepolia-rpc.publicnode.com");
+const CONTRACT_ADDRESS = "0xbb119466D2b424F6f140dB8B0A2122d650a7229F";
+const ABI = ["function partidas(uint256) view returns (address c, address o, uint256 m, uint8 e, address g)"];
+const contract = new ethers.Contract(CONTRACT_ADDRESS, ABI, provider);
+
 async function syncUserProfile(wallet) {
     try {
         const res = await db.query(`SELECT * FROM users WHERE wallet = $1`, [wallet.toLowerCase()]);
         if (res.rows.length > 0) {
-            // Buscamos solo a los sockets que tengan esta wallet para no recorrer todos
             const sockets = await io.fetchSockets();
-            sockets.forEach(s => {
-                if (s.wallet === wallet.toLowerCase()) s.emit('auth_success', res.rows[0]);
-            });
+            sockets.forEach(s => { if (s.wallet === wallet.toLowerCase()) s.emit('auth_success', res.rows[0]); });
         }
     } catch (e) { console.error("Error syncProfile:", e); }
 }
@@ -35,7 +37,6 @@ async function recordResult(game, winnerColor, reason) {
         const eloW = playersData.rows.find(r => r.wallet === white).elo;
         const eloB = playersData.rows.find(r => r.wallet === black).elo;
         let scoreW = winnerColor === 'w' ? 1 : (winnerColor === 'b' ? 0 : 0.5);
-        
         const K = 32;
         const expW = 1 / (1 + Math.pow(10, (eloB - eloW) / 400));
         const expB = 1 / (1 + Math.pow(10, (eloW - eloB) / 400));
@@ -44,6 +45,9 @@ async function recordResult(game, winnerColor, reason) {
 
         await db.query('UPDATE users SET last_color=$1, elo=$2, wins=wins+$3, losses=losses+$4, draws=draws+$5 WHERE wallet=$6', ['w', newEloW, scoreW === 1 ? 1 : 0, scoreW === 0 ? 1 : 0, scoreW === 0.5 ? 1 : 0, white]);
         await db.query('UPDATE users SET last_color=$1, elo=$2, wins=wins+$3, losses=losses+$4, draws=draws+$5 WHERE wallet=$6', ['b', newEloB, scoreW === 0 ? 1 : 0, scoreW === 1 ? 1 : 0, scoreW === 0.5 ? 1 : 0, black]);
+        
+        // --- AQUÍ LLAMARÍAMOS AL RELAY HTTP PARA LIQUIDAR EN BLOCKCHAIN ---
+        console.log(`🏁 Partida #${game.blockchainId} terminada. PGN listo para IA.`);
         
         await syncUserProfile(white);
         await syncUserProfile(black);
@@ -58,8 +62,6 @@ async function broadcastLobbyUpdate() {
 }
 
 io.on('connection', (socket) => {
-    console.log('🔗 Socket conectado:', socket.id);
-
     socket.on('reauth', async (wallet) => {
         if (!wallet) return;
         const cleanWallet = wallet.toLowerCase();
@@ -81,41 +83,50 @@ io.on('connection', (socket) => {
     });
 
     socket.on('get_challenges', async () => {
-        try {
-            // Enviamos apuestas abiertas
-            socket.emit('list_challenges', await lobbyManager.getOpenChallenges());
-            
-            // CORRECCIÓN SQL: Solo traemos la info básica para no romper el servidor
-            const live = await db.query(`
-                SELECT c.room_id, u.nickname as white_nick 
-                FROM challenges c 
-                JOIN users u ON c.creator_wallet = u.wallet 
-                WHERE c.status = 'playing' 
-                LIMIT 10
-            `);
-            socket.emit('list_live_games', live.rows);
-        } catch (e) { console.error("Error en get_challenges:", e); }
+        broadcastLobbyUpdate();
     });
 
+    // 2. CREACIÓN SEGURA (VERIFICADA EN CADENA)
     socket.on('create_challenge', async (data) => {
         if (!socket.wallet) return socket.emit('error_msg', "Sesión no iniciada");
-        const roomId = `room_${Math.random().toString(36).substring(7)}`;
-        if (await lobbyManager.createChallenge(socket.wallet, data.amount, data.timeLimit, roomId)) {
-            await gameManager.createGame(roomId, socket.wallet, data.timeLimit);
-            broadcastLobbyUpdate();
-            socket.emit('challenge_created', { roomId });
-        }
+        
+        const { amount, timeLimit, blockchainId } = data;
+
+        try {
+            // Verificamos en el contrato
+            const onChain = await contract.partidas(blockchainId);
+            if (onChain.c.toLowerCase() !== socket.wallet) {
+                return socket.emit('error_msg', "No eres el creador en el contrato");
+            }
+
+            const roomId = `room_${Math.random().toString(36).substring(7)}`;
+            if (await lobbyManager.createChallenge(socket.wallet, amount, timeLimit, roomId, blockchainId)) {
+                await gameManager.createGame(roomId, socket.wallet, timeLimit, blockchainId);
+                broadcastLobbyUpdate();
+                socket.emit('challenge_created', { roomId });
+            }
+        } catch (e) { socket.emit('error_msg', "Error al verificar pago on-chain"); }
     });
 
+    // 3. ACEPTACIÓN SEGURA (VERIFICADA EN CADENA)
     socket.on('accept_challenge', async (roomId) => {
         if (!socket.wallet) return;
         const g = gameManager.activeGames.get(roomId);
-        if (g && await lobbyManager.updateChallengeStatus(roomId, 'playing')) {
-            const joiner = socket.wallet.toLowerCase();
-            if (!g.white) g.white = joiner; else g.black = joiner;
-            io.emit('challenge_accepted_global', { roomId, joiner });
-            broadcastLobbyUpdate();
-        }
+        if (!g) return;
+
+        try {
+            const onChain = await contract.partidas(g.blockchainId);
+            if (onChain.o.toLowerCase() !== socket.wallet) {
+                return socket.emit('error_msg', "Primero debes pagar la apuesta en el contrato");
+            }
+
+            if (await lobbyManager.updateChallengeStatus(roomId, 'playing')) {
+                const joiner = socket.wallet.toLowerCase();
+                if (!g.white) g.white = joiner; else g.black = joiner;
+                io.emit('challenge_accepted_global', { roomId, joiner });
+                broadcastLobbyUpdate();
+            }
+        } catch (e) { socket.emit('error_msg', "Error al validar oponente"); }
     });
 
     socket.on('join_room', async ({ roomId }) => {
@@ -155,10 +166,8 @@ io.on('connection', (socket) => {
 
     socket.on('reset_game', async (roomId) => {
         const g = gameManager.activeGames.get(roomId);
-        if (g) {
-            if (g.interval) clearInterval(g.interval);
-            gameManager.activeGames.delete(roomId);
-        }
+        if (g && g.interval) clearInterval(g.interval);
+        gameManager.activeGames.delete(roomId);
         if (roomId) await lobbyManager.updateChallengeStatus(roomId, 'cancelled');
         broadcastLobbyUpdate();
         socket.emit('game_reset_complete');
