@@ -12,77 +12,81 @@ app.use(cors());
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" }, transports: ['websocket'] });
 
-// 1. CONFIGURACIÓN BLOCKCHAIN (LECTOR)
-const provider = new ethers.JsonRpcProvider("https://ethereum-sepolia-rpc.publicnode.com");
-const CONTRACT_ADDRESS = "0x3264C2a0542695f1bd4Ce4d83865449c53695710";
-const ABI = ["function partidas(uint256) view returns (address c, address o, uint256 m, uint8 e, address g)"];
+// --- LÓGICA DE ELO OFICIAL ---
+function getNewRatings(ratingA, ratingB, scoreA) {
+    const K = 32;
+    const expectedA = 1 / (1 + Math.pow(10, (ratingB - ratingA) / 400));
+    const expectedB = 1 / (1 + Math.pow(10, (ratingA - ratingB) / 400));
+    const scoreB = 1 - scoreA;
+    return {
+        newA: Math.round(ratingA + K * (scoreA - expectedA)),
+        newB: Math.round(ratingB + K * (scoreB - expectedB))
+    };
+}
 
-const contract = new ethers.Contract(CONTRACT_ADDRESS, ABI, provider);
-
+// Sincronizar perfil con todos los clientes del usuario
 async function syncUserProfile(wallet) {
     try {
         const res = await db.query(`SELECT * FROM users WHERE wallet = $1`, [wallet.toLowerCase()]);
-        if (res.rows.length > 0) {
-            const sockets = await io.fetchSockets();
-            sockets.forEach(s => { if (s.wallet === wallet.toLowerCase()) s.emit('auth_success', res.rows[0]); });
-        }
+        const sockets = await io.fetchSockets();
+        sockets.forEach(s => {
+            if (s.wallet === wallet.toLowerCase()) s.emit('auth_success', res.rows[0]);
+        });
     } catch (e) { console.error("Error syncProfile:", e); }
 }
 
-async function recordResult(game, winnerColor, reason) {
+// --- FUNCIÓN MAESTRA DE GUARDADO (INFRANQUEABLE) ---
+async function recordResult(game, winnerColor, reason, roomId) {
     if (game.interval) clearInterval(game.interval);
     game.status = 'finished';
-    const { white, black, chess, baseTime } = game; // baseTime nos sirve para identificar la apuesta
+    
+    const { white, black, chess, betAmount } = game;
 
     try {
-        // 1. Obtener Elos y Datos de la DB
+        // 1. Obtener Elos actuales
         const playersData = await db.query('SELECT wallet, elo FROM users WHERE wallet IN ($1, $2)', [white, black]);
         const eloWhite = playersData.rows.find(r => r.wallet === white).elo;
         const eloBlack = playersData.rows.find(r => r.wallet === black).elo;
-        
+
+        // 2. Calcular resultado matemático
         let scoreWhite = winnerColor === 'w' ? 1 : (winnerColor === 'b' ? 0 : 0.5);
         const { newA: newEloW, newB: newEloB } = getNewRatings(eloWhite, eloBlack, scoreWhite);
 
-        // 2. ACTUALIZAR ESTADÍSTICAS DE USUARIOS
-        await db.query('UPDATE users SET last_color=$1, elo=$2, wins=wins+$3, losses=losses+$4, draws=draws+$5 WHERE wallet=$6', 
-            ['w', newEloW, scoreWhite === 1 ? 1 : 0, scoreWhite === 0 ? 1 : 0, scoreWhite === 0.5 ? 1 : 0, white]);
-        await db.query('UPDATE users SET last_color=$1, elo=$2, wins=wins+$3, losses=losses+$4, draws=draws+$5 WHERE wallet=$6', 
-            ['b', newEloB, scoreWhite === 0 ? 1 : 0, scoreWhite === 1 ? 1 : 0, scoreWhite === 0.5 ? 1 : 0, black]);
-
-        // 3. 🔥 GUARDAR EL PGN EN EL HISTORIAL (LO QUE FALTABA)
+        // 3. 🔥 INSERTAR EN HISTORIAL (Lo que faltaba)
         const winnerWallet = winnerColor === 'w' ? white : (winnerColor === 'b' ? black : null);
-        
-        // Buscamos el monto de la apuesta desde la tabla challenges para que sea exacto
-        const challengeRes = await db.query('SELECT bet_amount, room_id FROM challenges WHERE room_id = $1', [game.roomId || '']);
-        const betAmount = challengeRes.rows[0]?.bet_amount || "0";
-
         await db.query(`
             INSERT INTO game_history (room_id, white_wallet, black_wallet, winner_wallet, bet_amount, pgn, end_reason)
             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-            [game.roomId || 'N/A', white, black, winnerWallet, betAmount, chess.pgn(), reason]
+            [roomId, white, black, winnerWallet, betAmount || '0', chess.pgn(), reason]
         );
 
-        console.log(`✅ Partida guardada en historial. Ganador: ${winnerWallet || "Tablas"}`);
+        // 4. Actualizar perfiles de usuario
+        if (scoreWhite === 1) {
+            await db.query('UPDATE users SET last_color=$1, elo=$2, wins=wins+1 WHERE wallet=$3', ['w', newEloW, white]);
+            await db.query('UPDATE users SET last_color=$1, elo=$2, losses=losses+1 WHERE wallet=$3', ['b', newEloB, black]);
+        } else if (scoreWhite === 0) {
+            await db.query('UPDATE users SET last_color=$1, elo=$2, wins=wins+1 WHERE wallet=$3', ['b', newEloB, black]);
+            await db.query('UPDATE users SET last_color=$1, elo=$2, losses=losses+1 WHERE wallet=$3', ['w', newEloW, white]);
+        } else {
+            await db.query('UPDATE users SET last_color=$1, elo=$2, draws=draws+1 WHERE wallet=$3', ['w', newEloW, white]);
+            await db.query('UPDATE users SET last_color=$1, elo=$2, draws=draws+1 WHERE wallet=$3', ['b', newEloB, black]);
+        }
 
-        // 4. Sincronizar perfiles
+        console.log(`🏁 Partida #${roomId} registrada con éxito.`);
         await syncUserProfile(white);
         await syncUserProfile(black);
-        
-    } catch (err) { console.error("❌ Error guardando historial:", err.message); }
-}
-async function broadcastLobbyUpdate() {
-    try {
-        const list = await lobbyManager.getOpenChallenges();
-        io.emit('list_challenges', list);
-    } catch (e) { console.error("Error broadcast:", e); }
+
+    } catch (err) {
+        console.error("❌ Error en recordResult:", err.message);
+    }
 }
 
 io.on('connection', (socket) => {
+    
     socket.on('reauth', async (wallet) => {
         if (!wallet) return;
-        const cleanWallet = wallet.toLowerCase();
-        socket.wallet = cleanWallet;
-        const res = await db.query(`SELECT * FROM users WHERE wallet = $1`, [cleanWallet]);
+        socket.wallet = wallet.toLowerCase();
+        const res = await db.query(`SELECT * FROM users WHERE wallet = $1`, [socket.wallet]);
         if (res.rows.length > 0) socket.emit('auth_success', res.rows[0]);
     });
 
@@ -95,54 +99,37 @@ io.on('connection', (socket) => {
                 socket.wallet = wallet;
                 socket.emit('auth_success', res.rows[0]);
             }
-        } catch (e) { socket.emit('auth_error', "Error firma"); }
+        } catch (e) { socket.emit('auth_error', "Falla en firma"); }
     });
 
     socket.on('get_challenges', async () => {
-        broadcastLobbyUpdate();
+        socket.emit('list_challenges', await lobbyManager.getOpenChallenges());
+        const live = await db.query(`SELECT c.room_id, u.nickname as white_nick FROM challenges c JOIN users u ON c.creator_wallet = u.wallet WHERE c.status = 'playing' LIMIT 10`);
+        socket.emit('list_live_games', live.rows);
     });
 
-    // 2. CREACIÓN SEGURA (VERIFICADA EN CADENA)
     socket.on('create_challenge', async (data) => {
-        if (!socket.wallet) return socket.emit('error_msg', "Sesión no iniciada");
-        
-        const { amount, timeLimit, blockchainId } = data;
-
-        try {
-            // Verificamos en el contrato
-            const onChain = await contract.partidas(blockchainId);
-            if (onChain.c.toLowerCase() !== socket.wallet) {
-                return socket.emit('error_msg', "No eres el creador en el contrato");
-            }
-
-            const roomId = `room_${Math.random().toString(36).substring(7)}`;
-            if (await lobbyManager.createChallenge(socket.wallet, amount, timeLimit, roomId, blockchainId)) {
-                await gameManager.createGame(roomId, socket.wallet, timeLimit, blockchainId);
-                broadcastLobbyUpdate();
-                socket.emit('challenge_created', { roomId });
-            }
-        } catch (e) { socket.emit('error_msg', "Error al verificar pago on-chain"); }
+        if (!socket.wallet) return;
+        const roomId = `room_${Math.random().toString(36).substring(7)}`;
+        if (await lobbyManager.createChallenge(socket.wallet, data.amount, data.timeLimit, roomId)) {
+            const game = await gameManager.createGame(roomId, socket.wallet, data.timeLimit);
+            game.betAmount = data.amount; // Guardamos el monto en RAM para el final
+            const list = await lobbyManager.getOpenChallenges();
+            io.emit('list_challenges', list);
+            socket.emit('challenge_created', { roomId });
+        }
     });
 
-    // 3. ACEPTACIÓN SEGURA (VERIFICADA EN CADENA)
     socket.on('accept_challenge', async (roomId) => {
         if (!socket.wallet) return;
         const g = gameManager.activeGames.get(roomId);
-        if (!g) return;
-
-        try {
-            const onChain = await contract.partidas(g.blockchainId);
-            if (onChain.o.toLowerCase() !== socket.wallet) {
-                return socket.emit('error_msg', "Primero debes pagar la apuesta en el contrato");
-            }
-
-            if (await lobbyManager.updateChallengeStatus(roomId, 'playing')) {
-                const joiner = socket.wallet.toLowerCase();
-                if (!g.white) g.white = joiner; else g.black = joiner;
-                io.emit('challenge_accepted_global', { roomId, joiner });
-                broadcastLobbyUpdate();
-            }
-        } catch (e) { socket.emit('error_msg', "Error al validar oponente"); }
+        if (g && await lobbyManager.updateChallengeStatus(roomId, 'playing')) {
+            const joiner = socket.wallet.toLowerCase();
+            if (!g.white) g.white = joiner; else g.black = joiner;
+            io.emit('challenge_accepted_global', { roomId, joiner });
+            const list = await lobbyManager.getOpenChallenges();
+            io.emit('list_challenges', list);
+        }
     });
 
     socket.on('join_room', async ({ roomId }) => {
@@ -156,7 +143,7 @@ io.on('connection', (socket) => {
                 const timeLeft = g.timers[turn] - Math.floor((Date.now() - g.lastMoveTimestamp) / 1000);
                 if (timeLeft <= 0) {
                     const winner = turn === 'w' ? 'b' : 'w';
-                    await recordResult(g, winner, 'timeout');
+                    await recordResult(g, winner, 'timeout', roomId);
                     io.to(roomId).emit('game_over', { reason: g.moveCount < 2 ? 'timeout_start' : 'timeout', winner });
                     await lobbyManager.updateChallengeStatus(roomId, 'finished');
                 } else {
@@ -171,9 +158,10 @@ io.on('connection', (socket) => {
     socket.on('move', async ({ roomId, moveData }) => {
         const result = await gameManager.handleMove(roomId, moveData, socket.wallet);
         if (result.error) return socket.emit('error_msg', result.error);
+        
         if (result.status === 'finished') {
             const gameObj = gameManager.activeGames.get(roomId);
-            await recordResult(gameObj, result.winner, result.reason);
+            await recordResult(gameObj, result.winner, result.reason, roomId);
             await lobbyManager.updateChallengeStatus(roomId, 'finished');
             io.to(roomId).emit('game_over', { reason: result.reason, winner: result.winner });
         }
@@ -182,10 +170,10 @@ io.on('connection', (socket) => {
 
     socket.on('reset_game', async (roomId) => {
         const g = gameManager.activeGames.get(roomId);
-        if (g && g.interval) clearInterval(g.interval);
-        gameManager.activeGames.delete(roomId);
+        if (g) { if (g.interval) clearInterval(g.interval); gameManager.activeGames.delete(roomId); }
         if (roomId) await lobbyManager.updateChallengeStatus(roomId, 'cancelled');
-        broadcastLobbyUpdate();
+        const list = await lobbyManager.getOpenChallenges();
+        io.emit('list_challenges', list);
         socket.emit('game_reset_complete');
     });
 });
