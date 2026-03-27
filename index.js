@@ -12,73 +12,51 @@ app.use(cors());
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" }, transports: ['websocket'] });
 
-// --- LÓGICA DE ELO OFICIAL ---
+// --- LÓGICA DE ELO ---
 function getNewRatings(ratingA, ratingB, scoreA) {
     const K = 32;
     const expectedA = 1 / (1 + Math.pow(10, (ratingB - ratingA) / 400));
     const expectedB = 1 / (1 + Math.pow(10, (ratingA - ratingB) / 400));
-    const scoreB = 1 - scoreA;
     return {
         newA: Math.round(ratingA + K * (scoreA - expectedA)),
-        newB: Math.round(ratingB + K * (scoreB - expectedB))
+        newB: Math.round(ratingB + K * ((1 - scoreA) - expectedB))
     };
 }
 
-// Sincronizar perfil con todos los clientes del usuario
 async function syncUserProfile(wallet) {
     try {
         const res = await db.query(`SELECT * FROM users WHERE wallet = $1`, [wallet.toLowerCase()]);
         const sockets = await io.fetchSockets();
-        sockets.forEach(s => {
-            if (s.wallet === wallet.toLowerCase()) s.emit('auth_success', res.rows[0]);
-        });
+        sockets.forEach(s => { if (s.wallet === wallet.toLowerCase()) s.emit('auth_success', res.rows[0]); });
     } catch (e) { console.error("Error syncProfile:", e); }
 }
 
-// --- FUNCIÓN MAESTRA DE GUARDADO (INFRANQUEABLE) ---
 async function recordResult(game, winnerColor, reason, roomId) {
     if (game.interval) clearInterval(game.interval);
     game.status = 'finished';
-    
     const { white, black, chess, betAmount } = game;
 
     try {
-        // 1. Obtener Elos actuales
         const playersData = await db.query('SELECT wallet, elo FROM users WHERE wallet IN ($1, $2)', [white, black]);
-        const eloWhite = playersData.rows.find(r => r.wallet === white).elo;
-        const eloBlack = playersData.rows.find(r => r.wallet === black).elo;
+        const eloW = playersData.rows.find(r => r.wallet === white).elo;
+        const eloB = playersData.rows.find(r => r.wallet === black).elo;
 
-        // 2. Calcular resultado matemático
-        let scoreWhite = winnerColor === 'w' ? 1 : (winnerColor === 'b' ? 0 : 0.5);
-        const { newA: newEloW, newB: newEloB } = getNewRatings(eloWhite, eloBlack, scoreWhite);
+        let scoreW = winnerColor === 'w' ? 1 : (winnerColor === 'b' ? 0 : 0.5);
+        const { newA: nW, newB: nB } = getNewRatings(eloW, eloB, scoreW);
 
-        // 3. 🔥 INSERTAR EN HISTORIAL (Lo que faltaba)
+        // Guardar en historial
         const winnerWallet = winnerColor === 'w' ? white : (winnerColor === 'b' ? black : null);
-        await db.query(`
-            INSERT INTO game_history (room_id, white_wallet, black_wallet, winner_wallet, bet_amount, pgn, end_reason)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-            [roomId, white, black, winnerWallet, betAmount || '0', chess.pgn(), reason]
-        );
+        await db.query(`INSERT INTO game_history (room_id, white_wallet, black_wallet, winner_wallet, bet_amount, pgn, end_reason)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)`, [roomId, white, black, winnerWallet, betAmount || '0', chess.pgn(), reason]);
 
-        // 4. Actualizar perfiles de usuario
-        if (scoreWhite === 1) {
-            await db.query('UPDATE users SET last_color=$1, elo=$2, wins=wins+1 WHERE wallet=$3', ['w', newEloW, white]);
-            await db.query('UPDATE users SET last_color=$1, elo=$2, losses=losses+1 WHERE wallet=$3', ['b', newEloB, black]);
-        } else if (scoreWhite === 0) {
-            await db.query('UPDATE users SET last_color=$1, elo=$2, wins=wins+1 WHERE wallet=$3', ['b', newEloB, black]);
-            await db.query('UPDATE users SET last_color=$1, elo=$2, losses=losses+1 WHERE wallet=$3', ['w', newEloW, white]);
-        } else {
-            await db.query('UPDATE users SET last_color=$1, elo=$2, draws=draws+1 WHERE wallet=$3', ['w', newEloW, white]);
-            await db.query('UPDATE users SET last_color=$1, elo=$2, draws=draws+1 WHERE wallet=$3', ['b', newEloB, black]);
-        }
+        // Actualizar Users
+        await db.query('UPDATE users SET last_color=$1, elo=$2, wins=wins+$3, losses=losses+$4, draws=draws+$5 WHERE wallet=$6', ['w', nW, scoreW === 1 ? 1 : 0, scoreW === 0 ? 1 : 0, scoreW === 0.5 ? 1 : 0, white]);
+        await db.query('UPDATE users SET last_color=$1, elo=$2, wins=wins+$3, losses=losses+$4, draws=draws+$5 WHERE wallet=$6', ['b', nB, scoreW === 0 ? 1 : 0, scoreW === 1 ? 1 : 0, scoreW === 0.5 ? 1 : 0, black]);
 
-        console.log(`🏁 Partida #${roomId} registrada con éxito.`);
         await syncUserProfile(white);
         await syncUserProfile(black);
-
-    } catch (err) {
-        console.error("❌ Error en recordResult:", err.message);
-    }
+        console.log(`✅ Partida ${roomId} registrada.`);
+    } catch (err) { console.error("Error recordResult:", err.message); }
 }
 
 io.on('connection', (socket) => {
@@ -99,13 +77,11 @@ io.on('connection', (socket) => {
                 socket.wallet = wallet;
                 socket.emit('auth_success', res.rows[0]);
             }
-        } catch (e) { socket.emit('auth_error', "Falla en firma"); }
+        } catch (e) { socket.emit('auth_error', "Error firma"); }
     });
 
     socket.on('get_challenges', async () => {
         socket.emit('list_challenges', await lobbyManager.getOpenChallenges());
-        const live = await db.query(`SELECT c.room_id, u.nickname as white_nick FROM challenges c JOIN users u ON c.creator_wallet = u.wallet WHERE c.status = 'playing' LIMIT 10`);
-        socket.emit('list_live_games', live.rows);
     });
 
     socket.on('create_challenge', async (data) => {
@@ -113,29 +89,48 @@ io.on('connection', (socket) => {
         const roomId = `room_${Math.random().toString(36).substring(7)}`;
         if (await lobbyManager.createChallenge(socket.wallet, data.amount, data.timeLimit, roomId)) {
             const game = await gameManager.createGame(roomId, socket.wallet, data.timeLimit);
-            game.betAmount = data.amount; // Guardamos el monto en RAM para el final
-            const list = await lobbyManager.getOpenChallenges();
-            io.emit('list_challenges', list);
+            game.betAmount = data.amount;
+            game.roomId = roomId; // Guardamos ID dentro del objeto
+            io.emit('list_challenges', await lobbyManager.getOpenChallenges());
             socket.emit('challenge_created', { roomId });
         }
     });
 
+    // --- ACEPTAR RETO CON RECUPERACIÓN DE MEMORIA (SENTIDO COMÚN) ---
     socket.on('accept_challenge', async (roomId) => {
-        if (!socket.wallet) return;
-        const g = gameManager.activeGames.get(roomId);
+        if (!socket.wallet) return socket.emit('error_msg', "Sesión perdida");
+
+        let g = gameManager.activeGames.get(roomId);
+        
+        // Si no está en RAM, lo intentamos reconstruir desde la DB
+        if (!g) {
+            console.log("Reconstruyendo partida desde DB...");
+            const res = await db.query("SELECT * FROM challenges WHERE room_id = $1 AND status = 'open'", [roomId]);
+            if (res.rows.length > 0) {
+                const c = res.rows[0];
+                g = await gameManager.createGame(roomId, c.creator_wallet, c.time_limit);
+                g.betAmount = c.bet_amount;
+                g.roomId = roomId;
+            }
+        }
+
         if (g && await lobbyManager.updateChallengeStatus(roomId, 'playing')) {
             const joiner = socket.wallet.toLowerCase();
+            // Asignación de color: el que no tenga el creador
             if (!g.white) g.white = joiner; else g.black = joiner;
+            
             io.emit('challenge_accepted_global', { roomId, joiner });
-            const list = await lobbyManager.getOpenChallenges();
-            io.emit('list_challenges', list);
+            io.emit('list_challenges', await lobbyManager.getOpenChallenges());
+        } else {
+            socket.emit('error_msg', "La apuesta ya no es válida o expiró");
         }
     });
 
     socket.on('join_room', async ({ roomId }) => {
         const g = gameManager.activeGames.get(roomId);
-        if (!g) return;
+        if (!g || !socket.wallet) return;
         socket.join(roomId);
+
         if (g.white && g.black && g.status === 'waiting') {
             g.status = 'active'; g.timers.w = gameManager.GRACE_TIME; g.lastMoveTimestamp = Date.now();
             g.interval = setInterval(async () => {
@@ -172,8 +167,7 @@ io.on('connection', (socket) => {
         const g = gameManager.activeGames.get(roomId);
         if (g) { if (g.interval) clearInterval(g.interval); gameManager.activeGames.delete(roomId); }
         if (roomId) await lobbyManager.updateChallengeStatus(roomId, 'cancelled');
-        const list = await lobbyManager.getOpenChallenges();
-        io.emit('list_challenges', list);
+        io.emit('list_challenges', await lobbyManager.getOpenChallenges());
         socket.emit('game_reset_complete');
     });
 });
