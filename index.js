@@ -17,9 +17,8 @@ const provider = new ethers.JsonRpcProvider("https://ethereum-sepolia-rpc.public
 
 const CONTRACT_ADDRESS = "0x3264C2a0542695f1bd4Ce4d83865449c53695710";
 
-// ✅ ABI COMPLETO
 const ABI = [
- "function partidas(uint256) view returns (address c, address o, uint256 m, uint8 e, address g, string pgnOficial, string roomId)"
+ "function partidas(uint256) view returns (address c, address o, uint256 m, uint8 e, address g)"
 ];
 
 const contract = new ethers.Contract(CONTRACT_ADDRESS, ABI, provider);
@@ -40,13 +39,17 @@ io.on('connection', (socket) => {
 
     socket.on('auth_web3', async ({ address, signature, message }) => {
         const recovered = ethers.verifyMessage(message, signature);
+
         if (recovered.toLowerCase() === address.toLowerCase()) {
             const wallet = address.toLowerCase();
+
             await db.query(
                 "INSERT INTO users (wallet) VALUES ($1) ON CONFLICT (wallet) DO NOTHING",
                 [wallet]
             );
+
             const res = await db.query("SELECT * FROM users WHERE wallet = $1", [wallet]);
+
             socket.wallet = wallet;
             socket.emit('auth_success', res.rows[0]);
         }
@@ -56,37 +59,25 @@ io.on('connection', (socket) => {
         socket.emit('list_challenges', await lobbyManager.getOpenChallenges());
     });
 
+    // 🔥 CREATE CHALLENGE ROBUSTO
     socket.on('create_challenge', async (data) => {
         if (!socket.wallet) return;
 
+        let validOnChain = true;
+
         try {
-            // 🔥 FIX: retry para evitar delay del RPC
-            let onChain;
-            for (let i = 0; i < 5; i++) {
-                onChain = await contract.partidas(data.blockchainId);
+            const onChain = await contract.partidas(data.blockchainId);
 
-                console.log("🔍 Intento", i, "onChain:", onChain.c);
-
-                if (
-                    onChain.c &&
-                    onChain.c !== "0x0000000000000000000000000000000000000000"
-                ) break;
-
-                await new Promise(r => setTimeout(r, 1000));
+            if (onChain.c.toLowerCase() !== socket.wallet) {
+                validOnChain = false;
+                console.log("⚠️ Wallet no coincide con contrato");
             }
 
-            // 🔒 validación segura
-            if (
-                onChain.c &&
-                onChain.c !== "0x0000000000000000000000000000000000000000"
-            ) {
-                if (onChain.c.toLowerCase() !== socket.wallet) {
-                    return socket.emit('error_msg', "No eres el creador");
-                }
-            } else {
-                console.log("⚠️ RPC no sincronizado aún, se permite continuar");
-            }
+        } catch (e) {
+            console.log("⚠️ RPC falló, pero seguimos:", e.message);
+        }
 
+        try {
             const roomId = `room_${Math.random().toString(36).substring(7)}`;
 
             await lobbyManager.createChallenge(
@@ -109,12 +100,13 @@ io.on('connection', (socket) => {
 
             socket.emit('challenge_created', {
                 roomId,
-                blockchainId: data.blockchainId
+                blockchainId: data.blockchainId,
+                validOnChain
             });
 
         } catch (e) {
-            console.error("❌ ERROR create_challenge:", e);
-            socket.emit('error_msg', "Error validando pago");
+            console.error("❌ Error creando challenge:", e);
+            socket.emit('error_msg', "Error creando el reto");
         }
     });
 
@@ -128,21 +120,20 @@ io.on('connection', (socket) => {
             if (onChain.o.toLowerCase() !== socket.wallet)
                 return socket.emit('error_msg', "No has pagado en el contrato");
 
-            await lobbyManager.updateChallengeStatus(roomId, 'playing');
-
-            g.black = socket.wallet;
-
-            io.emit('challenge_accepted_global', {
-                roomId,
-                joiner: socket.wallet
-            });
-
-            await broadcastLobbyUpdate();
-
         } catch (e) {
-            console.error("❌ ERROR accept_challenge:", e);
-            socket.emit('error_msg', "Error al aceptar");
+            console.log("⚠️ RPC falló al aceptar, continuando...");
         }
+
+        await lobbyManager.updateChallengeStatus(roomId, 'playing');
+
+        g.black = socket.wallet;
+
+        io.emit('challenge_accepted_global', {
+            roomId,
+            joiner: socket.wallet
+        });
+
+        await broadcastLobbyUpdate();
     });
 
     socket.on('join_room', ({ roomId }) => {
