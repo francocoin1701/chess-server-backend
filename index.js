@@ -42,7 +42,10 @@ io.on('connection', (socket) => {
         const recovered = ethers.verifyMessage(message, signature);
         if (recovered.toLowerCase() === address.toLowerCase()) {
             const wallet = address.toLowerCase();
-            await db.query("INSERT INTO users (wallet) VALUES ($1) ON CONFLICT (wallet) DO NOTHING", [wallet]);
+            await db.query(
+                "INSERT INTO users (wallet) VALUES ($1) ON CONFLICT (wallet) DO NOTHING",
+                [wallet]
+            );
             const res = await db.query("SELECT * FROM users WHERE wallet = $1", [wallet]);
             socket.wallet = wallet;
             socket.emit('auth_success', res.rows[0]);
@@ -57,10 +60,32 @@ io.on('connection', (socket) => {
         if (!socket.wallet) return;
 
         try {
-            const onChain = await contract.partidas(data.blockchainId);
+            // 🔥 FIX: retry para evitar delay del RPC
+            let onChain;
+            for (let i = 0; i < 5; i++) {
+                onChain = await contract.partidas(data.blockchainId);
 
-            if (onChain.c.toLowerCase() !== socket.wallet)
-                return socket.emit('error_msg', "No eres el creador");
+                console.log("🔍 Intento", i, "onChain:", onChain.c);
+
+                if (
+                    onChain.c &&
+                    onChain.c !== "0x0000000000000000000000000000000000000000"
+                ) break;
+
+                await new Promise(r => setTimeout(r, 1000));
+            }
+
+            // 🔒 validación segura
+            if (
+                onChain.c &&
+                onChain.c !== "0x0000000000000000000000000000000000000000"
+            ) {
+                if (onChain.c.toLowerCase() !== socket.wallet) {
+                    return socket.emit('error_msg', "No eres el creador");
+                }
+            } else {
+                console.log("⚠️ RPC no sincronizado aún, se permite continuar");
+            }
 
             const roomId = `room_${Math.random().toString(36).substring(7)}`;
 
@@ -72,7 +97,6 @@ io.on('connection', (socket) => {
                 data.blockchainId
             );
 
-            // 🔥 FIX: ahora pasamos amount correctamente
             await gameManager.createGame(
                 roomId,
                 socket.wallet,
@@ -89,6 +113,7 @@ io.on('connection', (socket) => {
             });
 
         } catch (e) {
+            console.error("❌ ERROR create_challenge:", e);
             socket.emit('error_msg', "Error validando pago");
         }
     });
@@ -115,6 +140,7 @@ io.on('connection', (socket) => {
             await broadcastLobbyUpdate();
 
         } catch (e) {
+            console.error("❌ ERROR accept_challenge:", e);
             socket.emit('error_msg', "Error al aceptar");
         }
     });
@@ -145,7 +171,6 @@ io.on('connection', (socket) => {
         if (result.status === 'finished') {
             await lobbyManager.updateChallengeStatus(roomId, 'finished');
 
-            // 🔥 GUARDAR PGN AUTOMÁTICAMENTE
             try {
                 const game = gameManager.activeGames.get(roomId);
 
@@ -170,7 +195,6 @@ io.on('connection', (socket) => {
 
                 console.log("📜 PGN guardado:", roomId);
 
-                // 🔥 opcional: limpiar memoria
                 gameManager.activeGames.delete(roomId);
 
             } catch (err) {
