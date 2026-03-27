@@ -84,14 +84,17 @@ io.on('connection', (socket) => {
         socket.emit('list_challenges', await lobbyManager.getOpenChallenges());
     });
 
-    socket.on('create_challenge', async (data) => {
+   socket.on('create_challenge', async (data) => {
         if (!socket.wallet) return;
-        const roomId = `room_${Math.random().toString(36).substring(7)}`;
+        
+        // RECIBIMOS EL roomId QUE VIENE DEL CONTRATO ( numericId )
+        const roomId = data.roomId; 
+        
         if (await lobbyManager.createChallenge(socket.wallet, data.amount, data.timeLimit, roomId)) {
             const game = await gameManager.createGame(roomId, socket.wallet, data.timeLimit);
             game.betAmount = data.amount;
-            game.roomId = roomId; // Guardamos ID dentro del objeto
-            io.emit('list_challenges', await lobbyManager.getOpenChallenges());
+            game.roomId = roomId;
+            broadcastLobbyUpdate();
             socket.emit('challenge_created', { roomId });
         }
     });
