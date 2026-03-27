@@ -4,7 +4,7 @@ const db = require('./db');
 const activeGames = new Map();
 const GRACE_TIME = 10; 
 
-const createGame = async (roomId, creatorWallet, initialMinutes, blockchainId) => {
+const createGame = async (roomId, creatorWallet, initialMinutes, blockchainId, betAmount = "0") => {
     const wallet = creatorWallet.toLowerCase();
     const mins = (initialMinutes && initialMinutes > 0) ? initialMinutes : 10;
     const timeInSeconds = mins * 60;
@@ -14,6 +14,7 @@ const createGame = async (roomId, creatorWallet, initialMinutes, blockchainId) =
     const assignedColor = lastColor === 'w' ? 'b' : 'w';
 
     const gameData = {
+        roomId, // 🔥 añadido
         chess: new Chess(),
         white: assignedColor === 'w' ? wallet : null,
         black: assignedColor === 'b' ? wallet : null,
@@ -22,9 +23,11 @@ const createGame = async (roomId, creatorWallet, initialMinutes, blockchainId) =
         lastMoveTimestamp: Date.now(),
         status: 'waiting',
         moveCount: 0,
-        blockchainId: blockchainId, // <--- Vínculo vital con la red
+        blockchainId,
+        betAmount, // 🔥 añadido
         interval: null
     };
+
     activeGames.set(roomId, gameData);
     return gameData;
 };
@@ -43,25 +46,44 @@ const handleMove = async (roomId, moveData, wallet) => {
             g.timers[turn] -= Math.floor((now - g.lastMoveTimestamp) / 1000);
             g.lastMoveTimestamp = now;
 
-            if (g.moveCount === 0) { g.timers.w = g.baseTime; g.timers.b = GRACE_TIME; }
-            else if (g.moveCount === 1) { g.timers.b = g.baseTime; }
+            if (g.moveCount === 0) { 
+                g.timers.w = g.baseTime; 
+                g.timers.b = GRACE_TIME; 
+            } else if (g.moveCount === 1) { 
+                g.timers.b = g.baseTime; 
+            }
+
             g.moveCount++;
 
             if (g.chess.isGameOver()) {
                 g.status = 'finished';
-                let result = { status: 'finished', pgn: g.chess.pgn(), timers: g.timers };
+
+                let winnerWallet = null;
+
                 if (g.chess.isCheckmate()) {
-                    result.reason = 'checkmate';
-                    result.winner = turn;
-                } else {
-                    result.reason = 'draw';
-                    result.winner = null;
+                    winnerWallet = turn === 'w' ? g.white : g.black; // 🔥 FIX
                 }
-                return result;
+
+                return {
+                    status: 'finished',
+                    pgn: g.chess.pgn(),
+                    timers: g.timers,
+                    winner: winnerWallet, // 🔥 FIX
+                    reason: g.chess.isCheckmate() ? 'checkmate' : 'draw'
+                };
             }
-            return { success: true, pgn: g.chess.pgn(), timers: g.timers, status: g.status, lastMoveTimestamp: g.lastMoveTimestamp };
+
+            return {
+                success: true,
+                pgn: g.chess.pgn(),
+                timers: g.timers,
+                status: g.status,
+                lastMoveTimestamp: g.lastMoveTimestamp
+            };
         }
-    } catch (e) { return { error: "Ilegal" }; }
+    } catch (e) { 
+        return { error: "Ilegal" }; 
+    }
 };
 
 module.exports = { activeGames, createGame, handleMove, GRACE_TIME };
