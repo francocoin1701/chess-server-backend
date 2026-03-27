@@ -32,29 +32,44 @@ async function syncUserProfile(wallet) {
 async function recordResult(game, winnerColor, reason) {
     if (game.interval) clearInterval(game.interval);
     game.status = 'finished';
-    const { white, black } = game;
-    try {
-        const playersData = await db.query('SELECT wallet, elo FROM users WHERE wallet IN ($1, $2)', [white, black]);
-        const eloW = playersData.rows.find(r => r.wallet === white).elo;
-        const eloB = playersData.rows.find(r => r.wallet === black).elo;
-        let scoreW = winnerColor === 'w' ? 1 : (winnerColor === 'b' ? 0 : 0.5);
-        const K = 32;
-        const expW = 1 / (1 + Math.pow(10, (eloB - eloW) / 400));
-        const expB = 1 / (1 + Math.pow(10, (eloW - eloB) / 400));
-        const newEloW = Math.round(eloW + K * (scoreW - expW));
-        const newEloB = Math.round(eloB + K * ((1 - scoreW) - expB));
+    const { white, black, chess, baseTime } = game; // baseTime nos sirve para identificar la apuesta
 
-        await db.query('UPDATE users SET last_color=$1, elo=$2, wins=wins+$3, losses=losses+$4, draws=draws+$5 WHERE wallet=$6', ['w', newEloW, scoreW === 1 ? 1 : 0, scoreW === 0 ? 1 : 0, scoreW === 0.5 ? 1 : 0, white]);
-        await db.query('UPDATE users SET last_color=$1, elo=$2, wins=wins+$3, losses=losses+$4, draws=draws+$5 WHERE wallet=$6', ['b', newEloB, scoreW === 0 ? 1 : 0, scoreW === 1 ? 1 : 0, scoreW === 0.5 ? 1 : 0, black]);
+    try {
+        // 1. Obtener Elos y Datos de la DB
+        const playersData = await db.query('SELECT wallet, elo FROM users WHERE wallet IN ($1, $2)', [white, black]);
+        const eloWhite = playersData.rows.find(r => r.wallet === white).elo;
+        const eloBlack = playersData.rows.find(r => r.wallet === black).elo;
         
-        // --- AQUÍ LLAMARÍAMOS AL RELAY HTTP PARA LIQUIDAR EN BLOCKCHAIN ---
-        console.log(`🏁 Partida #${game.blockchainId} terminada. PGN listo para IA.`);
+        let scoreWhite = winnerColor === 'w' ? 1 : (winnerColor === 'b' ? 0 : 0.5);
+        const { newA: newEloW, newB: newEloB } = getNewRatings(eloWhite, eloBlack, scoreWhite);
+
+        // 2. ACTUALIZAR ESTADÍSTICAS DE USUARIOS
+        await db.query('UPDATE users SET last_color=$1, elo=$2, wins=wins+$3, losses=losses+$4, draws=draws+$5 WHERE wallet=$6', 
+            ['w', newEloW, scoreWhite === 1 ? 1 : 0, scoreWhite === 0 ? 1 : 0, scoreWhite === 0.5 ? 1 : 0, white]);
+        await db.query('UPDATE users SET last_color=$1, elo=$2, wins=wins+$3, losses=losses+$4, draws=draws+$5 WHERE wallet=$6', 
+            ['b', newEloB, scoreWhite === 0 ? 1 : 0, scoreWhite === 1 ? 1 : 0, scoreWhite === 0.5 ? 1 : 0, black]);
+
+        // 3. 🔥 GUARDAR EL PGN EN EL HISTORIAL (LO QUE FALTABA)
+        const winnerWallet = winnerColor === 'w' ? white : (winnerColor === 'b' ? black : null);
         
+        // Buscamos el monto de la apuesta desde la tabla challenges para que sea exacto
+        const challengeRes = await db.query('SELECT bet_amount, room_id FROM challenges WHERE room_id = $1', [game.roomId || '']);
+        const betAmount = challengeRes.rows[0]?.bet_amount || "0";
+
+        await db.query(`
+            INSERT INTO game_history (room_id, white_wallet, black_wallet, winner_wallet, bet_amount, pgn, end_reason)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+            [game.roomId || 'N/A', white, black, winnerWallet, betAmount, chess.pgn(), reason]
+        );
+
+        console.log(`✅ Partida guardada en historial. Ganador: ${winnerWallet || "Tablas"}`);
+
+        // 4. Sincronizar perfiles
         await syncUserProfile(white);
         await syncUserProfile(black);
-    } catch (e) { console.error("Error recordResult:", e); }
+        
+    } catch (err) { console.error("❌ Error guardando historial:", err.message); }
 }
-
 async function broadcastLobbyUpdate() {
     try {
         const list = await lobbyManager.getOpenChallenges();
