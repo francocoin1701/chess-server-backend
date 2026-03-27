@@ -14,8 +14,9 @@ const io = new Server(server, { cors: { origin: "*" }, transports: ['websocket']
 
 // 1. CONFIGURACIÓN BLOCKCHAIN (LECTOR)
 const provider = new ethers.JsonRpcProvider("https://ethereum-sepolia-rpc.publicnode.com");
-const CONTRACT_ADDRESS = "0xbb119466D2b424F6f140dB8B0A2122d650a7229F";
+const CONTRACT_ADDRESS = "0x3264C2a0542695f1bd4Ce4d83865449c53695710";
 const ABI = ["function partidas(uint256) view returns (address c, address o, uint256 m, uint8 e, address g)"];
+
 const contract = new ethers.Contract(CONTRACT_ADDRESS, ABI, provider);
 
 async function syncUserProfile(wallet) {

@@ -1,4 +1,5 @@
 node_modules
 init_db.js
 ver_usuarios.js
+limpiarbd.js
 .gitignore
