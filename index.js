@@ -15,7 +15,7 @@ const io = new Server(server, { cors: { origin: "*" }, transports: ['websocket']
 
 const provider = new ethers.JsonRpcProvider("https://ethereum-sepolia-rpc.publicnode.com");
 
-const CONTRACT_ADDRESS = "0x3264C2a0542695f1bd4Ce4d83865449c53695710";
+const CONTRACT_ADDRESS = "0x397ac347B1EEBf16431DF9Ff6C2F24677cE19282";
 
 const ABI = [
  "function partidas(uint256) view returns (address c, address o, uint256 m, uint8 e, address g)"
