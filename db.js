@@ -1,13 +1,15 @@
-// db.js
-const { Client } = require('pg');
+require('dotenv').config();
+const { Pool } = require('pg');
 
-const client = new Client({
+const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: { rejectUnauthorized: false }
 });
 
-client.connect()
-    .then(() => console.log("✅ Conexión a PostgreSQL exitosa (Módulo DB)"))
-    .catch(err => console.error("❌ Error en DB:", err.message));
+pool.connect()
+    .then(() => console.log("Conexion a PostgreSQL exitosa"))
+    .catch(err => console.error("Error en DB:", err.message));
 
-module.exports = client;
+module.exports = {
+    query: (text, params) => pool.query(text, params)
+};

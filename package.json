@@ -12,8 +12,10 @@
   "dependencies": {
     "chess.js": "^1.4.0",
     "cors": "^2.8.6",
+    "dotenv": "^17.3.1",
     "ethers": "^6.16.0",
     "express": "^5.2.1",
+    "groq-sdk": "^1.1.2",
     "pg": "^8.20.0",
     "socket.io": "^4.8.3"
   }

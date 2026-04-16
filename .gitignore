@@ -4,3 +4,9 @@ ver_usuarios.js
 limpiarbd.js
 verPgn.js
 .gitignore
+.env
+limpiarDb.js
+migrarDb.js
+verMesasActivas.js
+VerStructuraDb.js
+

@@ -1,14 +1,11 @@
 const db = require('./db');
 
-/**
- * Crea una nueva apuesta en la base de datos vinculada al ID de la Blockchain
- */
-const createChallenge = async (wallet, amount, timeLimit, roomId, blockchainId) => {
+const createChallenge = async (wallet, amount, timeLimit, roomId, blockchainId, colorCreador) => {
     try {
         const res = await db.query(
-            `INSERT INTO challenges (creator_wallet, bet_amount, time_limit, room_id, status, blockchain_id) 
-             VALUES ($1, $2, $3, $4, 'open', $5) RETURNING *`,
-            [wallet.toLowerCase(), amount.toString(), timeLimit, roomId, blockchainId]
+            `INSERT INTO challenges (creator_wallet, bet_amount, time_limit, room_id, status, blockchain_id, color_creador) 
+             VALUES ($1, $2, $3, $4, 'open', $5, $6) RETURNING *`,
+            [wallet.toLowerCase(), amount.toString(), timeLimit, roomId, blockchainId, colorCreador]
         );
         return res.rows[0];
     } catch (e) {
@@ -17,9 +14,6 @@ const createChallenge = async (wallet, amount, timeLimit, roomId, blockchainId) 
     }
 };
 
-/**
- * Obtiene todas las apuestas abiertas.
- */
 const getOpenChallenges = async () => {
     try {
         const res = await db.query(`
@@ -29,7 +23,8 @@ const getOpenChallenges = async () => {
                 c.creator_wallet, 
                 c.bet_amount, 
                 c.time_limit, 
-                c.room_id, 
+                c.room_id,
+                c.color_creador,
                 u.nickname, 
                 u.elo 
             FROM challenges c
@@ -44,9 +39,6 @@ const getOpenChallenges = async () => {
     }
 };
 
-/**
- * Actualiza el estado de una apuesta
- */
 const updateChallengeStatus = async (roomId, newStatus) => {
     try {
         await db.query(
