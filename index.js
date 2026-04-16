@@ -14,7 +14,7 @@ app.use(cors());
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" }, transports: ['websocket'] });
 
-const provider = new ethers.JsonRpcProvider("https://ethereum-sepolia-rpc.publicnode.com");
+const provider = new ethers.JsonRpcProvider("https://eth-sepolia.g.alchemy.com/v2/ly6oQWP6UwzpBkxiChpcQuPMc2WQIlZk");
 
 const CONTRACT_ADDRESS = "0xa809761C3c878e982136b9f41519326193df1DF3";
 
