@@ -4,7 +4,9 @@ const createChallenge = async (wallet, amount, timeLimit, roomId, blockchainId, 
     try {
         const res = await db.query(
             `INSERT INTO challenges (creator_wallet, bet_amount, time_limit, room_id, status, blockchain_id, color_creador) 
-             VALUES ($1, $2, $3, $4, 'open', $5, $6) RETURNING *`,
+             VALUES ($1, $2, $3, $4, 'open', $5, $6) 
+             ON CONFLICT (blockchain_id) DO UPDATE SET status = 'open'
+             RETURNING *`,
             [wallet.toLowerCase(), amount.toString(), timeLimit, roomId, blockchainId, colorCreador]
         );
         return res.rows[0];
