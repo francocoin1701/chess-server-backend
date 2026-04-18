@@ -9,4 +9,6 @@ limpiarDb.js
 migrarDb.js
 verMesasActivas.js
 VerStructuraDb.js
+bobbitoManager.js
+undex.js
 

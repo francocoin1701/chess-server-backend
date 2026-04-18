@@ -31,10 +31,88 @@ const ABI = [
 
 const contract = new ethers.Contract(CONTRACT_ADDRESS, ABI, provider);
 
+// Inyectar contrato en lobbyManager para que pueda filtrar on-chain
+lobbyManager.init(contract, ethers);
+
+// Set para rastrear partidas que ya emitieron game_over desde finalizarPartida
+// Evita el segundo game_over cuando llega el evento PartidaFinalizada del contrato
+const partidasFinalizadasPorServidor = new Set();
+
 async function broadcastLobbyUpdate() {
     console.log("[BROADCAST] Enviando actualización de lobby a todos los clientes...");
     const list = await lobbyManager.getOpenChallenges();
     io.emit('list_challenges', list);
+}
+
+// ---------------------------------------------------------
+// SINCRONIZACIÓN PERIÓDICA CON BLOCKCHAIN (FILTRO DEFINITIVO)
+// ---------------------------------------------------------
+async function syncWithBlockchain() {
+    console.log("[SYNC] Iniciando sincronización con blockchain...");
+    try {
+        const nextId = Number(await contract.nextId());
+        console.log(`[SYNC] Total de partidas en contrato: ${nextId}`);
+
+        for (let i = 0; i < nextId; i++) {
+            try {
+                const onChain = await contract.partidas(i);
+                const estadoOnChain = Number(onChain.estado);
+                const roomId = `room_${i}`;
+
+                const dbRes = await db.query(
+                    "SELECT * FROM challenges WHERE blockchain_id = $1",
+                    [i]
+                );
+
+                if (dbRes.rows.length === 0) {
+                    if (estadoOnChain === 0 && onChain.creador !== ethers.ZeroAddress) {
+                        console.log(`[SYNC] Partida ${i} abierta on-chain pero no en DB, insertando...`);
+                        const amount = ethers.formatEther(onChain.montoApuesta);
+                        const colorCreador = Number(onChain.colorCreador);
+                        await lobbyManager.createChallenge(
+                            onChain.creador,
+                            amount,
+                            10,
+                            roomId,
+                            i,
+                            colorCreador
+                        );
+                    }
+                    continue;
+                }
+
+                const rowDB = dbRes.rows[0];
+                const statusDB = rowDB.status;
+
+                const mapaEstados = { 0: 'open', 1: 'playing', 2: 'finished', 3: 'cancelled' };
+                const statusEsperado = mapaEstados[estadoOnChain];
+
+                if (statusDB !== statusEsperado) {
+                    console.log(`[SYNC] Partida ${i}: DB dice '${statusDB}' pero contrato dice '${statusEsperado}', corrigiendo...`);
+                    await lobbyManager.updateChallengeStatus(roomId, statusEsperado);
+
+                    if ((estadoOnChain === 2 || estadoOnChain === 3) && activeGames.has(roomId)) {
+                        console.log(`[SYNC] Eliminando juego fantasma de memoria: ${roomId}`);
+                        const g = activeGames.get(roomId);
+                        if (g && g.interval) clearInterval(g.interval);
+                        activeGames.delete(roomId);
+                    }
+                }
+
+                if (onChain.creador === ethers.ZeroAddress && statusDB === 'open') {
+                    console.log(`[SYNC] Partida ${i} tiene ZeroAddress on-chain, eliminando de DB...`);
+                    await lobbyManager.updateChallengeStatus(roomId, 'cancelled');
+                }
+
+            } catch (err) {
+                console.error(`[SYNC] Error procesando partida ${i}:`, err.message);
+            }
+        }
+
+        console.log("[SYNC] Sincronización completada.");
+    } catch (e) {
+        console.error("[SYNC] Error general en syncWithBlockchain:", e.message);
+    }
 }
 
 // ---------------------------------------------------------
@@ -47,21 +125,13 @@ function initContractListeners() {
         const blockchainId = Number(id);
         const amount = ethers.formatEther(monto);
         const roomId = `room_${blockchainId}`;
-        
         console.log(`📡 [EVENTO: RetoCreado] ID:${blockchainId}, Creador:${creador}`);
 
         try {
             const onChain = await contract.partidas(blockchainId);
             const colorCreador = Number(onChain.colorCreador);
 
-            await lobbyManager.createChallenge(
-                creador,
-                amount,
-                10,
-                roomId,
-                blockchainId,
-                colorCreador
-            );
+            await lobbyManager.createChallenge(creador, amount, 10, roomId, blockchainId, colorCreador);
 
             const whiteWallet = colorCreador === 0 ? creador.toLowerCase() : null;
             const blackWallet = colorCreador === 1 ? creador.toLowerCase() : null;
@@ -70,13 +140,7 @@ function initContractListeners() {
                 await createGame(roomId, whiteWallet, blackWallet, 10, blockchainId, amount);
             }
 
-            io.emit('challenge_created', {
-                roomId,
-                blockchainId,
-                colorCreador,
-                creator_wallet: creador
-            });
-
+            io.emit('challenge_created', { roomId, blockchainId, colorCreador, creator_wallet: creador });
             await broadcastLobbyUpdate();
         } catch (e) {
             console.error("Error procesando RetoCreado:", e.message);
@@ -89,7 +153,7 @@ function initContractListeners() {
         console.log(`📡 [EVENTO: RetoAceptado] ID:${blockchainId}, Oponente:${oponente}`);
 
         await lobbyManager.updateChallengeStatus(roomId, 'playing');
-        
+
         let g = activeGames.get(roomId);
         if (g) {
             const onChain = await contract.partidas(blockchainId);
@@ -97,7 +161,6 @@ function initContractListeners() {
             if (colorCreador === 0) g.black = oponente.toLowerCase();
             else g.white = oponente.toLowerCase();
         } else {
-            // Recrear juego en memoria si no existe
             const onChain = await contract.partidas(blockchainId);
             const colorCreador = Number(onChain.colorCreador);
             const amount = ethers.formatEther(onChain.montoApuesta);
@@ -106,11 +169,7 @@ function initContractListeners() {
             await createGame(roomId, white, black, 10, blockchainId, amount);
         }
 
-        io.emit('challenge_accepted_global', {
-            roomId,
-            joiner: oponente.toLowerCase()
-        });
-
+        io.emit('challenge_accepted_global', { roomId, joiner: oponente.toLowerCase() });
         await broadcastLobbyUpdate();
     });
 
@@ -121,12 +180,23 @@ function initContractListeners() {
 
         await lobbyManager.updateChallengeStatus(roomId, 'finished');
         await broadcastLobbyUpdate();
-        
-        // Enviar a frontend para que muestre pantalla de resultado
-        io.to(roomId).emit('game_over', {
-            winner,
-            reason: resultado === 1 ? 'checkmate' : (resultado === 2 ? 'timeout' : 'draw')
-        });
+
+        // Si finalizarPartida ya emitió game_over, NO emitir de nuevo
+        // Esto es lo que causaba que apareciera la pantalla de resultado
+        // en todos los PCs que estuvieran en el lobby al minar la transacción
+        if (partidasFinalizadasPorServidor.has(roomId)) {
+            console.log(`[EVENTO: PartidaFinalizada] game_over ya emitido para ${roomId}, omitiendo duplicado`);
+            partidasFinalizadasPorServidor.delete(roomId);
+        } else {
+            // Caso edge: la partida terminó on-chain sin pasar por finalizarPartida
+            io.to(roomId).emit('game_over', {
+                winner,
+                reason: Number(resultado) === 1 ? 'checkmate' : (Number(resultado) === 2 ? 'timeout' : 'draw')
+            });
+        }
+
+        const g = activeGames.get(roomId);
+        if (g && g.interval) clearInterval(g.interval);
         activeGames.delete(roomId);
     });
 
@@ -135,12 +205,22 @@ function initContractListeners() {
         const roomId = `room_${blockchainId}`;
         console.log(`📡 [EVENTO: PartidaCancelada] ID:${blockchainId}`);
         await lobbyManager.updateChallengeStatus(roomId, 'cancelled');
+
+        const g = activeGames.get(roomId);
+        if (g && g.interval) clearInterval(g.interval);
         activeGames.delete(roomId);
+
         await broadcastLobbyUpdate();
     });
 }
 
 initContractListeners();
+
+// Sync al arrancar y cada 5 minutos
+syncWithBlockchain().then(() => {
+    console.log("[SYNC] Sync inicial completada.");
+});
+setInterval(syncWithBlockchain, 5 * 60 * 1000);
 
 async function finalizarPartida(roomId, result, io) {
     await lobbyManager.updateChallengeStatus(roomId, 'finished');
@@ -178,7 +258,13 @@ async function finalizarPartida(roomId, result, io) {
         }
     }
 
+    // Marcar que este roomId ya tiene game_over emitido
+    // para que el evento PartidaFinalizada del contrato no lo repita
+    partidasFinalizadasPorServidor.add(roomId);
+
+    if (game.interval) clearInterval(game.interval);
     activeGames.delete(roomId);
+
     io.to(roomId).emit('game_over', result);
 }
 
@@ -246,25 +332,69 @@ io.on('connection', (socket) => {
     });
 
     socket.on('create_challenge', async (data) => {
-        // Ahora es opcional, ya que el event listener lo hará
-        // Pero lo dejamos como 'fast path'
-        console.log("[SOCKET_CREATE] Fast path creation requested");
-        // El listener detectará el evento en segundos.
+        console.log("[SOCKET_CREATE] Creación rápida solicitada desde Frontend:", data.blockchainId);
+        const roomId = `room_${data.blockchainId}`;
+        try {
+            await lobbyManager.createChallenge(
+                data.creador || socket.wallet,
+                data.amount,
+                data.timeLimit || 10,
+                roomId,
+                data.blockchainId,
+                data.colorCreador
+            );
+            await broadcastLobbyUpdate();
+        } catch (e) {
+            console.error("Error guardando reto en DB:", e);
+        }
     });
 
     socket.on('accept_challenge', async (blockchainId) => {
-        console.log("[SOCKET_ACCEPT] Fast path acceptance requested");
-        // El listener detectará el evento en segundos.
+        console.log("[SOCKET_ACCEPT] Aceptación rápida solicitada desde Frontend:", blockchainId);
+        const roomId = `room_${blockchainId}`;
+        await lobbyManager.updateChallengeStatus(roomId, 'playing');
+        await broadcastLobbyUpdate();
     });
 
+    // CAPA 3: Verificación on-chain antes de entrar a la sala
     socket.on('join_room', async ({ roomId }) => {
         console.log(`[SOCKET_JOIN] roomId: ${roomId}, wallet: ${socket.wallet}`);
         if (!socket.wallet) return;
 
         try {
             const blockchainId = Number(roomId.replace("room_", ""));
-            const p = await contract.partidas(blockchainId);
 
+            let onChainPartida;
+            try {
+                onChainPartida = await contract.partidas(blockchainId);
+            } catch (err) {
+                console.error(`[JOIN_ROOM] Error consultando contrato para ${roomId}:`, err.message);
+                return socket.emit('error_msg', 'Error verificando partida en blockchain');
+            }
+
+            if (!onChainPartida.creador || onChainPartida.creador === ethers.ZeroAddress) {
+                console.warn(`[JOIN_ROOM] ${roomId} no existe on-chain, bloqueando entrada`);
+                await lobbyManager.updateChallengeStatus(roomId, 'cancelled');
+                return socket.emit('error_msg', 'Esta partida no existe en blockchain');
+            }
+
+            const estadoOnChain = Number(onChainPartida.estado);
+
+            if (estadoOnChain === 2 || estadoOnChain === 3) {
+                console.warn(`[JOIN_ROOM] ${roomId} ya no está activa on-chain (estado: ${estadoOnChain})`);
+                const nuevoEstado = estadoOnChain === 3 ? 'cancelled' : 'finished';
+                await lobbyManager.updateChallengeStatus(roomId, nuevoEstado);
+
+                if (activeGames.has(roomId)) {
+                    const g = activeGames.get(roomId);
+                    if (g && g.interval) clearInterval(g.interval);
+                    activeGames.delete(roomId);
+                }
+
+                return socket.emit('error_msg', 'Esta partida ya finalizó o fue cancelada');
+            }
+
+            const p = onChainPartida;
             let white = null;
             let black = null;
             let colorCreador = Number(p.colorCreador);
@@ -321,6 +451,13 @@ io.on('connection', (socket) => {
         } catch (e) {
             console.error("Error en join_room:", e);
         }
+    });
+
+    // Salir de la sala explícitamente — evita recibir game_over estando en el lobby
+    socket.on('leave_room', ({ roomId }) => {
+        if (!roomId) return;
+        socket.leave(roomId);
+        console.log(`[SOCKET_LEAVE] wallet: ${socket.wallet} salió de ${roomId}`);
     });
 
     socket.on('move', async ({ roomId, moveData }) => {
