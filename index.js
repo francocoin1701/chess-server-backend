@@ -31,11 +31,8 @@ const ABI = [
 
 const contract = new ethers.Contract(CONTRACT_ADDRESS, ABI, provider);
 
-// Inyectar contrato en lobbyManager para que pueda filtrar on-chain
 lobbyManager.init(contract, ethers);
 
-// Set para rastrear partidas que ya emitieron game_over desde finalizarPartida
-// Evita el segundo game_over cuando llega el evento PartidaFinalizada del contrato
 const partidasFinalizadasPorServidor = new Set();
 
 async function broadcastLobbyUpdate() {
@@ -45,7 +42,27 @@ async function broadcastLobbyUpdate() {
 }
 
 // ---------------------------------------------------------
-// SINCRONIZACIÓN PERIÓDICA CON BLOCKCHAIN (FILTRO DEFINITIVO)
+// PENDING PAYMENT — verificar si hay pagos pendientes para una wallet
+// Retorna el registro de game_history con payment_status = 'pending'
+// ---------------------------------------------------------
+async function getPendingPayment(wallet) {
+    try {
+        const res = await db.query(`
+            SELECT * FROM game_history 
+            WHERE (white_wallet = $1 OR black_wallet = $1)
+            AND payment_status = 'pending'
+            ORDER BY played_at DESC
+            LIMIT 1
+        `, [wallet.toLowerCase()]);
+        return res.rows[0] || null;
+    } catch (e) {
+        console.error("[PENDING] Error consultando pago pendiente:", e.message);
+        return null;
+    }
+}
+
+// ---------------------------------------------------------
+// SINCRONIZACIÓN PERIÓDICA CON BLOCKCHAIN
 // ---------------------------------------------------------
 async function syncWithBlockchain() {
     console.log("[SYNC] Iniciando sincronización con blockchain...");
@@ -60,8 +77,7 @@ async function syncWithBlockchain() {
                 const roomId = `room_${i}`;
 
                 const dbRes = await db.query(
-                    "SELECT * FROM challenges WHERE blockchain_id = $1",
-                    [i]
+                    "SELECT * FROM challenges WHERE blockchain_id = $1", [i]
                 );
 
                 if (dbRes.rows.length === 0) {
@@ -69,26 +85,18 @@ async function syncWithBlockchain() {
                         console.log(`[SYNC] Partida ${i} abierta on-chain pero no en DB, insertando...`);
                         const amount = ethers.formatEther(onChain.montoApuesta);
                         const colorCreador = Number(onChain.colorCreador);
-                        await lobbyManager.createChallenge(
-                            onChain.creador,
-                            amount,
-                            10,
-                            roomId,
-                            i,
-                            colorCreador
-                        );
+                        await lobbyManager.createChallenge(onChain.creador, amount, 10, roomId, i, colorCreador);
                     }
                     continue;
                 }
 
                 const rowDB = dbRes.rows[0];
                 const statusDB = rowDB.status;
-
                 const mapaEstados = { 0: 'open', 1: 'playing', 2: 'finished', 3: 'cancelled' };
                 const statusEsperado = mapaEstados[estadoOnChain];
 
                 if (statusDB !== statusEsperado) {
-                    console.log(`[SYNC] Partida ${i}: DB dice '${statusDB}' pero contrato dice '${statusEsperado}', corrigiendo...`);
+                    console.log(`[SYNC] Partida ${i}: DB='${statusDB}' contrato='${statusEsperado}', corrigiendo...`);
                     await lobbyManager.updateChallengeStatus(roomId, statusEsperado);
 
                     if ((estadoOnChain === 2 || estadoOnChain === 3) && activeGames.has(roomId)) {
@@ -116,7 +124,7 @@ async function syncWithBlockchain() {
 }
 
 // ---------------------------------------------------------
-// RECEPTOR DE EVENTOS DE BLOCKCHAIN (CORE)
+// RECEPTOR DE EVENTOS DE BLOCKCHAIN
 // ---------------------------------------------------------
 function initContractListeners() {
     console.log("🎮 Inicializando listeners de eventos del contrato...");
@@ -130,7 +138,6 @@ function initContractListeners() {
         try {
             const onChain = await contract.partidas(blockchainId);
             const colorCreador = Number(onChain.colorCreador);
-
             await lobbyManager.createChallenge(creador, amount, 10, roomId, blockchainId, colorCreador);
 
             const whiteWallet = colorCreador === 0 ? creador.toLowerCase() : null;
@@ -179,16 +186,25 @@ function initContractListeners() {
         console.log(`📡 [EVENTO: PartidaFinalizada] ID:${blockchainId}, Winner:${winner}`);
 
         await lobbyManager.updateChallengeStatus(roomId, 'finished');
+
+        // Marcar como pagado en game_history — el oráculo resolvió exitosamente
+        try {
+            await db.query(`
+                UPDATE game_history 
+                SET payment_status = 'paid' 
+                WHERE blockchain_id = $1
+            `, [blockchainId]);
+            console.log(`[PAGO] Partida ${blockchainId} marcada como pagada`);
+        } catch (e) {
+            console.error("[PAGO] Error marcando partida como pagada:", e.message);
+        }
+
         await broadcastLobbyUpdate();
 
-        // Si finalizarPartida ya emitió game_over, NO emitir de nuevo
-        // Esto es lo que causaba que apareciera la pantalla de resultado
-        // en todos los PCs que estuvieran en el lobby al minar la transacción
         if (partidasFinalizadasPorServidor.has(roomId)) {
             console.log(`[EVENTO: PartidaFinalizada] game_over ya emitido para ${roomId}, omitiendo duplicado`);
             partidasFinalizadasPorServidor.delete(roomId);
         } else {
-            // Caso edge: la partida terminó on-chain sin pasar por finalizarPartida
             io.to(roomId).emit('game_over', {
                 winner,
                 reason: Number(resultado) === 1 ? 'checkmate' : (Number(resultado) === 2 ? 'timeout' : 'draw')
@@ -216,7 +232,6 @@ function initContractListeners() {
 
 initContractListeners();
 
-// Sync al arrancar y cada 5 minutos
 syncWithBlockchain().then(() => {
     console.log("[SYNC] Sync inicial completada.");
 });
@@ -228,17 +243,27 @@ async function finalizarPartida(roomId, result, io) {
     const game = activeGames.get(roomId);
     if (!game) return;
 
+    // Determinar actionType según razón
+    // 1 = checkmate, 2 = timeout, 3 = draw
+    const actionType = result.reason === 'checkmate' ? 1 : result.reason === 'timeout' ? 2 : 3;
+
     try {
+        // Guardar con payment_status='pending' y action_type
+        // Si el pago falla, el frontend puede reintentarlo desde el lobby
         await db.query(`
             INSERT INTO game_history (
                 room_id, white_wallet, black_wallet,
-                winner_wallet, bet_amount, pgn, blockchain_id
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7)
+                winner_wallet, bet_amount, pgn, blockchain_id,
+                payment_status, action_type
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+            ON CONFLICT DO NOTHING
         `, [
             roomId, game.white, game.black,
             result.winner, game.betAmount,
-            result.pgn, game.blockchainId
+            result.pgn, game.blockchainId,
+            'pending', actionType
         ]);
+        console.log(`[HISTORIAL] Partida ${roomId} guardada con payment_status=pending`);
     } catch (err) {
         console.error("Error guardando historial:", err);
     }
@@ -251,15 +276,13 @@ async function finalizarPartida(roomId, result, io) {
             s.emit('trigger_agent_ready', {
                 blockchainId: game.blockchainId,
                 pgn: result.pgn,
-                actionType: 2,
+                actionType,
                 reason: result.reason || 'checkmate'
             });
             break;
         }
     }
 
-    // Marcar que este roomId ya tiene game_over emitido
-    // para que el evento PartidaFinalizada del contrato no lo repita
     partidasFinalizadasPorServidor.add(roomId);
 
     if (game.interval) clearInterval(game.interval);
@@ -307,6 +330,21 @@ io.on('connection', (socket) => {
         const res = await db.query("SELECT * FROM users WHERE wallet = $1", [socket.wallet]);
         socket.emit('auth_success', res.rows[0]);
         socket.emit('list_challenges', await lobbyManager.getOpenChallenges());
+
+        // Verificar si tiene pago pendiente y notificar al frontend
+        const pending = await getPendingPayment(socket.wallet);
+        if (pending) {
+            console.log(`[PENDING] Wallet ${socket.wallet} tiene pago pendiente:`, pending.blockchain_id);
+            socket.emit('pending_payment', {
+                blockchainId: pending.blockchain_id,
+                pgn: pending.pgn,
+                actionType: pending.action_type,
+                winnerWallet: pending.winner_wallet,
+                whiteWallet: pending.white_wallet,
+                blackWallet: pending.black_wallet,
+                betAmount: pending.bet_amount
+            });
+        }
     });
 
     socket.on('auth_web3', async ({ address, signature, message }) => {
@@ -324,11 +362,42 @@ io.on('connection', (socket) => {
             socket.wallet = wallet;
             socket.emit('auth_success', res.rows[0]);
             socket.emit('list_challenges', await lobbyManager.getOpenChallenges());
+
+            // Verificar si tiene pago pendiente
+            const pending = await getPendingPayment(wallet);
+            if (pending) {
+                console.log(`[PENDING] Wallet ${wallet} tiene pago pendiente:`, pending.blockchain_id);
+                socket.emit('pending_payment', {
+                    blockchainId: pending.blockchain_id,
+                    pgn: pending.pgn,
+                    actionType: pending.action_type,
+                    winnerWallet: pending.winner_wallet,
+                    whiteWallet: pending.white_wallet,
+                    blackWallet: pending.black_wallet,
+                    betAmount: pending.bet_amount
+                });
+            }
         }
     });
 
     socket.on('get_challenges', async () => {
         socket.emit('list_challenges', await lobbyManager.getOpenChallenges());
+    });
+
+    // El frontend avisa que el pago fue enviado exitosamente
+    // El servidor lo marca como paid en DB sin esperar el evento on-chain
+    socket.on('payment_sent', async ({ blockchainId }) => {
+        console.log(`[PENDING] Wallet ${socket.wallet} reporta pago enviado para partida ${blockchainId}`);
+        try {
+            await db.query(`
+                UPDATE game_history 
+                SET payment_status = 'paid'
+                WHERE blockchain_id = $1
+            `, [blockchainId]);
+            socket.emit('payment_confirmed', { blockchainId });
+        } catch (e) {
+            console.error("[PENDING] Error marcando pago:", e.message);
+        }
     });
 
     socket.on('create_challenge', async (data) => {
@@ -356,13 +425,41 @@ io.on('connection', (socket) => {
         await broadcastLobbyUpdate();
     });
 
-    // CAPA 3: Verificación on-chain antes de entrar a la sala
     socket.on('join_room', async ({ roomId }) => {
         console.log(`[SOCKET_JOIN] roomId: ${roomId}, wallet: ${socket.wallet}`);
         if (!socket.wallet) return;
 
         try {
             const blockchainId = Number(roomId.replace("room_", ""));
+
+            // NUEVO: Verificar si esta partida tiene pago pendiente en DB
+            // Si lo tiene, no mandar al tablero sino emitir pending_payment
+            const pendingRes = await db.query(`
+                SELECT * FROM game_history 
+                WHERE blockchain_id = $1 AND payment_status = 'pending'
+                LIMIT 1
+            `, [blockchainId]);
+
+            if (pendingRes.rows.length > 0) {
+                const pending = pendingRes.rows[0];
+                const esJugador = 
+                    socket.wallet === pending.white_wallet.toLowerCase() || 
+                    socket.wallet === pending.black_wallet.toLowerCase();
+
+                if (esJugador) {
+                    console.log(`[PENDING] join_room bloqueado por pago pendiente en partida ${blockchainId}`);
+                    socket.emit('pending_payment', {
+                        blockchainId: pending.blockchain_id,
+                        pgn: pending.pgn,
+                        actionType: pending.action_type,
+                        winnerWallet: pending.winner_wallet,
+                        whiteWallet: pending.white_wallet,
+                        blackWallet: pending.black_wallet,
+                        betAmount: pending.bet_amount
+                    });
+                    return;
+                }
+            }
 
             let onChainPartida;
             try {
@@ -418,14 +515,7 @@ io.on('connection', (socket) => {
             }
 
             if (!activeGames.get(roomId)) {
-                await createGame(
-                    roomId,
-                    white,
-                    black,
-                    10,
-                    blockchainId,
-                    ethers.formatEther(p.montoApuesta)
-                );
+                await createGame(roomId, white, black, 10, blockchainId, ethers.formatEther(p.montoApuesta));
             } else {
                 const g = activeGames.get(roomId);
                 if (white) g.white = white;
@@ -453,7 +543,6 @@ io.on('connection', (socket) => {
         }
     });
 
-    // Salir de la sala explícitamente — evita recibir game_over estando en el lobby
     socket.on('leave_room', ({ roomId }) => {
         if (!roomId) return;
         socket.leave(roomId);
