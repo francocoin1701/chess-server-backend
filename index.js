@@ -399,6 +399,23 @@ io.on('connection', (socket) => {
             console.error("[PENDING] Error marcando pago:", e.message);
         }
     });
+    socket.on('check_pending_payment', async ({ blockchainId }) => {
+        try {
+            const onChain = await contract.partidas(blockchainId);
+            const estado = Number(onChain.estado);
+            if (estado === 2) {
+                // Confirmado on-chain → actualizar DB y notificar
+                await db.query(
+                    "UPDATE game_history SET payment_status = 'paid' WHERE blockchain_id = $1",
+                    [blockchainId]
+                );
+                socket.emit('payment_confirmed', { blockchainId });
+            }
+            // Si no es 2, no hacer nada — banner permanece
+        } catch (e) {
+            console.error("[CHECK_PENDING]", e.message);
+        }
+    });
 
     socket.on('create_challenge', async (data) => {
         console.log("[SOCKET_CREATE] Creación rápida solicitada desde Frontend:", data.blockchainId);
@@ -442,8 +459,8 @@ io.on('connection', (socket) => {
 
             if (pendingRes.rows.length > 0) {
                 const pending = pendingRes.rows[0];
-                const esJugador = 
-                    socket.wallet === pending.white_wallet.toLowerCase() || 
+                const esJugador =
+                    socket.wallet === pending.white_wallet.toLowerCase() ||
                     socket.wallet === pending.black_wallet.toLowerCase();
 
                 if (esJugador) {
